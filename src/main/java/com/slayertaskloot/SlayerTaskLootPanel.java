@@ -195,7 +195,7 @@ class SlayerTaskLootPanel extends PluginPanel
 				totalSupplies += task.getSupplyCost();
 			}
 
-			final long total = config.profitMode() == ProfitMode.NET
+			final long total = config.trackSupplies()
 				? totalLoot - totalSupplies
 				: totalLoot;
 
@@ -260,7 +260,7 @@ class SlayerTaskLootPanel extends PluginPanel
 		// --- Value summary ---
 		box.add(row("Drops", gp(task.getLootValue()), PROFIT_GREEN, FontManager.getRunescapeSmallFont()));
 
-		if (config.profitMode() == ProfitMode.NET)
+		if (config.trackSupplies())
 		{
 			box.add(row("Supplies", "-" + gp(task.getSupplyCost()), SUPPLY_ORANGE,
 				FontManager.getRunescapeSmallFont()));

@@ -23,24 +23,11 @@ public interface SlayerTaskLootConfig extends Config
 	String displaySection = "display";
 
 	@ConfigItem(
-		keyName = "profitMode",
-		name = "Value shown",
-		description = "Gross drop value: total GE value of everything the task dropped.<br>"
-			+ "Net profit after supplies: the same figure minus supplies used while on task.",
-		section = displaySection,
-		position = 0
-	)
-	default ProfitMode profitMode()
-	{
-		return ProfitMode.NET;
-	}
-
-	@ConfigItem(
 		keyName = "showItemValues",
 		name = "Show item values",
 		description = "Show the GE value alongside each item's quantity",
 		section = displaySection,
-		position = 1
+		position = 0
 	)
 	default boolean showItemValues()
 	{
@@ -52,7 +39,7 @@ public interface SlayerTaskLootConfig extends Config
 		name = "Tasks to remember",
 		description = "How many completed tasks to keep in the History tab. Set to 0 to keep none.",
 		section = displaySection,
-		position = 2
+		position = 1
 	)
 	@Range(min = 0, max = 50)
 	default int historySize()
@@ -100,13 +87,27 @@ public interface SlayerTaskLootConfig extends Config
 	String suppliesSection = "supplies";
 
 	@ConfigItem(
+		keyName = "trackSupplies",
+		name = "Track supplies and profit",
+		description = "Measure what you use up on task and show profit after supplies.<br>"
+			+ "When off, no supply measurement is done at all and the panel reports the gross "
+			+ "GE value of the task's drops only. The settings below have no effect.",
+		section = suppliesSection,
+		position = 0
+	)
+	default boolean trackSupplies()
+	{
+		return true;
+	}
+
+	@ConfigItem(
 		keyName = "sessionTimeout",
 		name = "End session after (minutes)",
 		description = "A session stays open while task kills keep happening. After this long with "
 			+ "no credited kill it closes, and supplies stop counting toward the task until the "
 			+ "next kill. Keeps unrelated activity off the task's bill.",
 		section = suppliesSection,
-		position = 0
+		position = 1
 	)
 	@Range(min = 1, max = 60)
 	default int sessionTimeout()
@@ -121,7 +122,7 @@ public interface SlayerTaskLootConfig extends Config
 			+ "out and boosts drunk before the first kill are included. Set to 0 to count only "
 			+ "from the first credited kill onward.",
 		section = suppliesSection,
-		position = 1
+		position = 2
 	)
 	@Range(min = 0, max = 300)
 	default int graceWindow()

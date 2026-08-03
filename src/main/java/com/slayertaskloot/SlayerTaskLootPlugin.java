@@ -799,6 +799,14 @@ public class SlayerTaskLootPlugin extends Plugin
 		}
 		supplyDirty = false;
 
+		if (!config.trackSupplies())
+		{
+			// Feature off: don't diff anything. The snapshot is deliberately left stale and
+			// gets rebaselined when the setting is turned back on, so nothing consumed while
+			// off is billed retroactively.
+			return;
+		}
+
 		if (isResyncInterfaceOpen())
 		{
 			// Banking, trading or shopping — re-baseline so restocking isn't charged.
@@ -1007,12 +1015,20 @@ public class SlayerTaskLootPlugin extends Plugin
 		// Config changes arrive from the Swing thread, and rebuilding the panel resolves item
 		// names and prices through ItemManager, so hop across before touching game state.
 		final boolean trim = "historySize".equals(event.getKey());
+		final boolean suppliesToggled = "trackSupplies".equals(event.getKey());
 		clientThread.invokeLater(() ->
 		{
 			if (trim)
 			{
 				trimHistory();
 				persist();
+			}
+			if (suppliesToggled)
+			{
+				// Rebaseline on the way back in. Without this, everything used while tracking
+				// was off would land on the task the moment it's switched on.
+				supplyTracker.resync();
+				supplyDirty = false;
 			}
 			pushToPanel();
 		});

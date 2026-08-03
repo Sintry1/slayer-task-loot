@@ -26,8 +26,8 @@ Some monsters don't drop loot as they die; Araxxor leaves it to be gathered afte
 
 Late drops are only credited when they come from a monster already **confirmed as a target of this task** — learned by watching what dies on the ticks the slayer counter moves. Kill credit is recorded per tick rather than per NPC, so without that name check a wide window would sweep up any drop that happened to land inside it. With it, widening the window doesn't pull in stray kills.
 
-### Net profit after supplies
-Optionally shows profit rather than gross drop value, subtracting what you used getting the kills, with a breakdown of what went:
+### Net profit after supplies (optional)
+Entirely opt-out via **Track supplies and profit**. Switch it off and the plugin is a pure drop tracker: no supply measurement happens at all and the panel reports gross GE value only. Switch it on and profit is shown after supplies, with a breakdown of what went:
 
 ```
 Drops                    1.4M gp
@@ -71,7 +71,6 @@ Completed tasks are kept per character and reloaded on login, with a configurabl
 
 | Setting | Default | Description |
 |---|---|---|
-| Value shown | Net profit after supplies | Gross drop value, or that figure minus supplies used on task |
 | Show item values | On | Show the GE value next to each item's quantity |
 | Tasks to remember | 10 | How many completed tasks to keep in History (0–50) |
 
@@ -85,6 +84,7 @@ Completed tasks are kept per character and reloaded on login, with a configurabl
 
 | Setting | Default | Description |
 |---|---|---|
+| Track supplies and profit | On | Off makes this a pure drop tracker — no supply measurement at all, gross value only. The two settings below have no effect when off |
 | End session after (minutes) | 5 | Idle time with no credited kill before supplies stop counting toward the task (1–60) |
 | Grace window (seconds) | 30 | How far before a session opens supplies still count, for teleports and pre-fight boosts (0–300) |
 
