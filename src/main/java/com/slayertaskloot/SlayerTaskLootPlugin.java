@@ -16,6 +16,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Deque;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
@@ -29,12 +30,14 @@ import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
 import net.runelite.api.ItemComposition;
+import net.runelite.api.NPC;
 import net.runelite.api.NPCComposition;
 import net.runelite.api.events.ActorDeath;
 import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.GameTick;
 import net.runelite.api.events.ItemContainerChanged;
 import net.runelite.api.events.MenuOptionClicked;
+import net.runelite.api.events.NpcDespawned;
 import net.runelite.api.events.VarbitChanged;
 import net.runelite.api.events.WidgetClosed;
 import net.runelite.api.events.WidgetLoaded;
@@ -90,10 +93,18 @@ public class SlayerTaskLootPlugin extends Plugin
 	private static final int BOSS_TASK_ID = 98;
 
 	/**
-	 * Largest counter drop treated as kills. A kill moves the counter by one, so anything
-	 * beyond a small allowance is a cancellation or reassignment rather than combat.
+	 * Largest counter drop still counted as kills when an assignment ends. Generous enough to
+	 * cover a barrage stack finishing the task, small enough that cancelling with a long way
+	 * to go isn't mistaken for combat.
 	 */
-	private static final int MAX_CREDITS_PER_CHANGE = 5;
+	private static final int MAX_FINISHING_KILLS = 12;
+
+	/**
+	 * Slack in ticks when lining a death or a drop up against a slayer counter change. They
+	 * arrive in the same tick in an order the client doesn't control, so an exact match would
+	 * be a coin flip.
+	 */
+	private static final int CREDIT_MATCH_TOLERANCE = 2;
 
 	/** Persist at most this often, in game ticks, so a long task isn't a write per kill. */
 	private static final int PERSIST_INTERVAL_TICKS = 10;
@@ -134,8 +145,15 @@ public class SlayerTaskLootPlugin extends Plugin
 	/** Last observed slayer counter value. -1 until the first read of this login. */
 	private int lastSlayerCount = -1;
 
-	/** Ticks on which the slayer counter went down, i.e. a kill was credited to the task. */
-	private final Set<Integer> creditTicks = new HashSet<>();
+	/**
+	 * NPC names established as targets of the current assignment, learned by seeing them die
+	 * on a tick the slayer counter moved. Lets a drop that arrives long after the kill still
+	 * be recognised, without a hardcoded task-to-monster table.
+	 */
+	private final Set<String> confirmedTargets = new HashSet<>();
+
+	/** Recently deceased NPC name -> tick, held briefly so it can be matched against a credit. */
+	private final Map<String, Integer> recentDeaths = new HashMap<>();
 
 	/** Loot awaiting attribution, held one tick so the counter change has time to land. */
 	private final Deque<PendingLoot> pendingLoot = new ArrayDeque<>();
@@ -146,8 +164,22 @@ public class SlayerTaskLootPlugin extends Plugin
 	/** Groups currently open that make item movement something other than consumption. */
 	private final Set<Integer> openInterfaces = new HashSet<>();
 
+	// Memoised slayer DB resolution, keyed on the varps it derives from. See resolveTaskName().
+	private int cachedTaskId = -1;
+	private int cachedBossId = -1;
+	private String cachedTaskName;
+	private int cachedAreaId = Integer.MIN_VALUE;
+	private String cachedTaskLocation;
+
+	/** Rendered history, rebuilt only when history changes rather than on every refresh. */
+	private List<TaskView> historyViews = Collections.emptyList();
+	private boolean historyViewsDirty = true;
+
 	private boolean sessionOpen;
 	private int lastCreditTick = -1;
+
+	/** Tick the counter reached zero, or -1. Keeps a finished task open for its late loot. */
+	private int taskEndTick = -1;
 	private boolean supplyDirty;
 	private boolean persistDirty;
 	private boolean panelDirty;
@@ -202,7 +234,9 @@ public class SlayerTaskLootPlugin extends Plugin
 		supplyDirty = false;
 		persistDirty = false;
 		panelDirty = false;
-		creditTicks.clear();
+		taskEndTick = -1;
+		confirmedTargets.clear();
+		recentDeaths.clear();
 		pendingLoot.clear();
 		graceBuffer.clear();
 		openInterfaces.clear();
@@ -242,8 +276,9 @@ public class SlayerTaskLootPlugin extends Plugin
 			{
 				// Credit the kill that finished the assignment, then stop. Archiving waits
 				// for the tick loop, because that final drop is still pending attribution.
-				creditIfKill(amount);
+				creditTaskEnd();
 				activeTask.setEndedAt(System.currentTimeMillis());
+				taskEndTick = client.getTickCount();
 				closeSession();
 				markDirty();
 			}
@@ -290,13 +325,14 @@ public class SlayerTaskLootPlugin extends Plugin
 	}
 
 	/**
-	 * Credits kills for a drop in the slayer counter — the one hard signal this plugin rests
-	 * on, since the counter only moves for kills that actually counted toward the task.
+	 * Credits kills for a mid-task drop in the slayer counter — the one hard signal this
+	 * plugin rests on, since the counter only moves for kills that counted toward the task.
 	 *
-	 * <p>Large drops are ignored. Cancelling an assignment sets the counter straight to zero
-	 * from whatever was left, and crediting that as kills would invent a burst of them. Note
-	 * that a spurious credit can never invent loot: a drop is only attributed if one genuinely
-	 * arrived on that tick.
+	 * <p>Deliberately uncapped. Barraging a stack in the Catacombs can take the counter down
+	 * by nine in a single change, and rejecting that as implausible would throw away both the
+	 * kills and every drop that came with them. A drop landing on a value above zero is always
+	 * kills: reassignment is caught by the identity check before this runs, and cancelling
+	 * always lands on zero, never on a positive number.
 	 */
 	private void creditIfKill(int amount)
 	{
@@ -305,21 +341,77 @@ public class SlayerTaskLootPlugin extends Plugin
 			return;
 		}
 
-		final int killed = lastSlayerCount - amount;
-		if (killed > MAX_CREDITS_PER_CHANGE)
+		creditKills(lastSlayerCount - amount);
+	}
+
+	/**
+	 * Handles the counter reaching zero, which is either the finishing kill or a cancelled
+	 * assignment. The counter alone can't tell them apart, so the two consequences are
+	 * separated rather than gambling on one answer:
+	 *
+	 * <ul>
+	 *   <li><b>Loot</b> is always credited for the tick. Getting this wrong on a completion
+	 *   would lose the finishing drop, and it costs nothing on a cancellation — you're stood
+	 *   at a slayer master, where nothing is dropping.</li>
+	 *   <li><b>The kill count</b> only moves when the drop is small enough to be kills, so
+	 *   cancelling with forty left doesn't book forty kills against an abandoned task.</li>
+	 * </ul>
+	 */
+	private void creditTaskEnd()
+	{
+		if (lastSlayerCount <= 0)
 		{
-			log.debug("Ignoring counter drop of {} — cancelled or reassigned, not kills", killed);
 			return;
 		}
 
-		creditKills(killed);
+		lastCreditTick = client.getTickCount();
+		openSession();
+
+		if (lastSlayerCount <= MAX_FINISHING_KILLS)
+		{
+			activeTask.addKills(lastSlayerCount);
+		}
+		else
+		{
+			log.debug("Counter dropped {} straight to zero — cancelled, not counted as kills",
+				lastSlayerCount);
+		}
 	}
 
+	/**
+	 * Resolves the assignment name, memoised on the varps it derives from.
+	 *
+	 * <p>The cache is the point, not an optimisation: this runs from the {@code SLAYER_COUNT}
+	 * handler, so without it every single kill would trigger a fresh scan of the slayer task
+	 * table. Barraging a stack multiplies that by the number of NPCs dying at once, which is
+	 * exactly how a plugin ends up stuttering on multi-kills.
+	 */
 	@Nullable
 	private String resolveTaskName()
 	{
 		final int taskId = client.getVarpValue(VarPlayerID.SLAYER_TARGET);
+		final int bossId = client.getVarbitValue(VarbitID.SLAYER_TARGET_BOSSID);
 
+		if (taskId == cachedTaskId && bossId == cachedBossId && cachedTaskName != null)
+		{
+			return cachedTaskName;
+		}
+
+		final String resolved = lookUpTaskName(taskId, bossId);
+		if (resolved != null)
+		{
+			// Only a hit is cached. A miss means the DB rows aren't populated yet, and caching
+			// that would pin the failure in place instead of retrying on the next varp change.
+			cachedTaskId = taskId;
+			cachedBossId = bossId;
+			cachedTaskName = resolved;
+		}
+		return resolved;
+	}
+
+	@Nullable
+	private String lookUpTaskName(int taskId, int bossId)
+	{
 		int taskRow;
 		if (taskId == BOSS_TASK_ID)
 		{
@@ -327,7 +419,7 @@ public class SlayerTaskLootPlugin extends Plugin
 				DBTableID.SlayerTaskSublist.ID,
 				DBTableID.SlayerTaskSublist.COL_TASK_SUBTABLE_ID,
 				0,
-				client.getVarbitValue(VarbitID.SLAYER_TARGET_BOSSID));
+				bossId);
 			if (bossRows.isEmpty())
 			{
 				return null;
@@ -353,12 +445,22 @@ public class SlayerTaskLootPlugin extends Plugin
 			: name.substring(0, 1).toUpperCase() + name.substring(1);
 	}
 
+	/** Memoised for the same reason as {@link #resolveTaskName()} — it runs per kill too. */
 	@Nullable
 	private String resolveTaskLocation()
 	{
 		final int areaId = client.getVarpValue(VarPlayerID.SLAYER_AREA);
+
+		if (areaId == cachedAreaId)
+		{
+			return cachedTaskLocation;
+		}
+
 		if (areaId <= 0)
 		{
+			// A master that assigns no area. Safe to cache: there is no lookup to retry.
+			cachedAreaId = areaId;
+			cachedTaskLocation = null;
 			return null;
 		}
 
@@ -369,8 +471,15 @@ public class SlayerTaskLootPlugin extends Plugin
 			return null;
 		}
 
-		return (String) client.getDBTableField(
+		final String resolved = (String) client.getDBTableField(
 			areaRows.get(0), DBTableID.SlayerArea.COL_AREA_NAME_IN_HELPER, 0)[0];
+
+		if (resolved != null)
+		{
+			cachedAreaId = areaId;
+			cachedTaskLocation = resolved;
+		}
+		return resolved;
 	}
 
 	private void startTask(String taskName, @Nullable String taskLocation, int initialAmount)
@@ -384,7 +493,11 @@ public class SlayerTaskLootPlugin extends Plugin
 		// Anything still awaiting attribution belonged to the assignment just archived, and
 		// must not land on this one.
 		pendingLoot.clear();
-		creditTicks.clear();
+		lastCreditTick = -1;
+		taskEndTick = -1;
+		// Targets are per assignment: what counted for the last task says nothing about this one.
+		confirmedTargets.clear();
+		recentDeaths.clear();
 		supplyTracker.resync();
 		markDirty();
 
@@ -413,10 +526,12 @@ public class SlayerTaskLootPlugin extends Plugin
 		if (worthKeeping)
 		{
 			history.add(0, activeTask);
+			historyViewsDirty = true;
 		}
 
 		trimHistory();
 		activeTask = null;
+		taskEndTick = -1;
 		closeSession();
 		markDirty();
 	}
@@ -427,6 +542,7 @@ public class SlayerTaskLootPlugin extends Plugin
 		while (history.size() > max)
 		{
 			history.remove(history.size() - 1);
+			historyViewsDirty = true;
 		}
 	}
 
@@ -438,7 +554,6 @@ public class SlayerTaskLootPlugin extends Plugin
 	{
 		activeTask.addKills(count);
 		lastCreditTick = client.getTickCount();
-		creditTicks.add(lastCreditTick);
 		openSession();
 		markDirty();
 	}
@@ -516,7 +631,7 @@ public class SlayerTaskLootPlugin extends Plugin
 				continue;
 			}
 
-			if (activeTask != null && creditTicks.contains(loot.tick))
+			if (activeTask != null && isCreditedDrop(loot))
 			{
 				for (ItemStack item : loot.items)
 				{
@@ -528,9 +643,102 @@ public class SlayerTaskLootPlugin extends Plugin
 
 			it.remove();
 		}
+	}
 
-		// Credit ticks are only needed while loot for that tick may still be pending.
-		creditTicks.removeIf(tick -> tick < now - 1);
+	/**
+	 * Decides whether a drop belongs to the task.
+	 *
+	 * <p>Two cases, because not every monster drops its loot as it dies:
+	 *
+	 * <ul>
+	 *   <li><b>Dropped on death</b> — the drop lands within a tick or two of the counter
+	 *   moving. Credited outright; nothing else needs to be known about it.</li>
+	 *   <li><b>Collected afterwards</b> — Araxxor and friends leave loot to be picked up, so
+	 *   the drop can arrive long after the counter moved. Credited only if it came from a
+	 *   monster already confirmed as a target of this assignment.</li>
+	 * </ul>
+	 *
+	 * <p>That name check is what keeps the late window honest. Credit is recorded per tick,
+	 * not per NPC — the counter says a task kill happened, never which monster it was — so a
+	 * window that trusted timing alone would sweep up any drop that happened to land inside
+	 * it, including from something that had nothing to do with the task.
+	 */
+	private boolean isCreditedDrop(PendingLoot loot)
+	{
+		if (lastCreditTick < 0)
+		{
+			return false;
+		}
+
+		final int sinceCredit = loot.tick - lastCreditTick;
+
+		// A drop marginally ahead of the counter change is still that kill's drop.
+		if (sinceCredit < -CREDIT_MATCH_TOLERANCE)
+		{
+			return false;
+		}
+
+		if (sinceCredit <= CREDIT_MATCH_TOLERANCE)
+		{
+			return true;
+		}
+
+		return sinceCredit <= toTicks(config.lootCreditWindow())
+			&& confirmedTargets.contains(loot.npcName);
+	}
+
+	/**
+	 * Notes an NPC death so it can be matched against a counter change.
+	 *
+	 * <p>Reconciliation is deferred to the tick loop rather than done here, because the death
+	 * and the counter change land in the same tick in an order we don't control.
+	 */
+	@SuppressWarnings("unused")
+	@Subscribe
+	public void onNpcDespawned(NpcDespawned event)
+	{
+		if (activeTask == null)
+		{
+			return;
+		}
+
+		final NPC npc = event.getNpc();
+		if (npc.isDead())
+		{
+			noteNpcDeath(npc);
+		}
+	}
+
+	private void noteNpcDeath(NPC npc)
+	{
+		if (npc.getName() != null)
+		{
+			recentDeaths.put(Text.removeTags(npc.getName()), client.getTickCount());
+		}
+	}
+
+	/** Promotes anything that died alongside a counter change to a confirmed task target. */
+	private void reconcileTargets(int now)
+	{
+		for (Iterator<Map.Entry<String, Integer>> it = recentDeaths.entrySet().iterator(); it.hasNext(); )
+		{
+			final Map.Entry<String, Integer> death = it.next();
+			final int deathTick = death.getValue();
+
+			if (lastCreditTick >= 0 && Math.abs(deathTick - lastCreditTick) <= CREDIT_MATCH_TOLERANCE)
+			{
+				if (confirmedTargets.add(death.getKey()))
+				{
+					log.debug("Confirmed {} as a target of this task", death.getKey());
+				}
+				it.remove();
+			}
+			else if (deathTick < now - CREDIT_MATCH_TOLERANCE)
+			{
+				// Died without the counter moving — not a task target, at least not this kill.
+				it.remove();
+			}
+		}
 	}
 
 	// ------------------------------------------------------------------
@@ -571,6 +779,15 @@ public class SlayerTaskLootPlugin extends Plugin
 			// Losing an inventory is not a supply cost.
 			supplyTracker.resync();
 			supplyDirty = false;
+			return;
+		}
+
+		// Second source for target confirmation alongside onNpcDespawned. Bosses with scripted
+		// death sequences don't always despawn in a state that reads as dead, and missing the
+		// death would mean their collected loot never gets recognised.
+		if (activeTask != null && event.getActor() instanceof NPC)
+		{
+			noteNpcDeath((NPC) event.getActor());
 		}
 	}
 
@@ -667,6 +884,7 @@ public class SlayerTaskLootPlugin extends Plugin
 
 		// Kill credit for this tick is already registered by onVarbitChanged, which fires
 		// during packet processing, so the session state below is up to date.
+		reconcileTargets(now);
 		resolvePendingLoot();
 		processSupplies();
 
@@ -684,8 +902,12 @@ public class SlayerTaskLootPlugin extends Plugin
 
 		pruneGraceBuffer(now);
 
-		// A completed assignment stays active until its final drop has been attributed.
-		if (activeTask != null && activeTask.isCompleted() && pendingLoot.isEmpty())
+		// A finished assignment is held open until its late-loot window has run out, not just
+		// until the tick after the last kill. Archiving the moment the counter hits zero would
+		// mean a boss whose loot has to be collected — Araxxor, say — loses its final drop,
+		// because there'd be no active task left for it to land on by the time it arrives.
+		if (activeTask != null && activeTask.isCompleted() && pendingLoot.isEmpty()
+			&& taskEndTick >= 0 && now - taskEndTick > toTicks(config.lootCreditWindow()))
 		{
 			archiveActiveTask();
 			pushToPanel();
@@ -741,6 +963,15 @@ public class SlayerTaskLootPlugin extends Plugin
 		if (state == GameState.LOGGED_IN)
 		{
 			load();
+
+			// A task that finished before logging out has no loot still to arrive, and its
+			// late-loot window can't span a session. Close it rather than leaving a finished
+			// assignment presented as the current one.
+			if (activeTask != null && activeTask.isCompleted())
+			{
+				archiveActiveTask();
+			}
+
 			// Carried items aren't readable until now, and anything that changed while
 			// logged out must not be charged.
 			supplyTracker.resync();
@@ -749,13 +980,17 @@ public class SlayerTaskLootPlugin extends Plugin
 		else if (state == GameState.LOGIN_SCREEN || state == GameState.HOPPING)
 		{
 			persist();
+			// Tick counts don't carry across a session, so anchors measured in ticks are
+			// meaningless now. A new kill re-establishes them.
+			lastCreditTick = -1;
+			taskEndTick = -1;
 			// The counter is re-read on login; treat the next read as a fresh baseline so
 			// logging in never looks like a burst of credited kills.
 			lastSlayerCount = -1;
 			closeSession();
 			supplyTracker.clear();
 			pendingLoot.clear();
-			creditTicks.clear();
+			recentDeaths.clear();
 			openInterfaces.clear();
 		}
 	}
@@ -831,6 +1066,7 @@ public class SlayerTaskLootPlugin extends Plugin
 			history = new ArrayList<>();
 		}
 
+		historyViewsDirty = true;
 		trimHistory();
 		pushToPanel();
 	}
@@ -865,6 +1101,7 @@ public class SlayerTaskLootPlugin extends Plugin
 		clientThread.invokeLater(() ->
 		{
 			history = new ArrayList<>();
+			historyViewsDirty = true;
 			persist();
 			pushToPanel();
 		});
@@ -891,11 +1128,22 @@ public class SlayerTaskLootPlugin extends Plugin
 		}
 
 		final TaskView current = activeTask == null ? null : toView(activeTask);
-		final List<TaskView> past = new ArrayList<>(history.size());
-		for (TaskLootRecord record : history)
+
+		// Only the active task changes between refreshes. Re-resolving every stored task's
+		// item names and prices on each pass would mean thousands of lookups a few times a
+		// second once the history is full, for output that is byte-for-byte identical.
+		if (historyViewsDirty)
 		{
-			past.add(toView(record));
+			final List<TaskView> rebuilt = new ArrayList<>(history.size());
+			for (TaskLootRecord record : history)
+			{
+				rebuilt.add(toView(record));
+			}
+			historyViews = Collections.unmodifiableList(rebuilt);
+			historyViewsDirty = false;
 		}
+
+		final List<TaskView> past = historyViews;
 
 		SwingUtilities.invokeLater(() ->
 		{

@@ -203,7 +203,9 @@ class SupplyTracker
 	 *
 	 * @return the dose count, or 0 when the name isn't dose-based
 	 */
-	private static int doseCount(String name)
+	// Package-private rather than private so the parsing can be tested directly; it's a
+	// heuristic over item names and the only part of this class testable without a client.
+	static int doseCount(String name)
 	{
 		if (name.isEmpty() || name.charAt(name.length() - 1) != ')')
 		{

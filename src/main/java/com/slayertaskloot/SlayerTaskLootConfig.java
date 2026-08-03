@@ -61,13 +61,41 @@ public interface SlayerTaskLootConfig extends Config
 	}
 
 	// -------------------------------------------------------------------------
+	// Loot
+	// -------------------------------------------------------------------------
+
+	@ConfigSection(
+		name = "Loot",
+		description = "Controls which drops get credited to the task",
+		position = 1
+	)
+	String lootSection = "loot";
+
+	@ConfigItem(
+		keyName = "lootCreditWindow",
+		name = "Late loot window (seconds)",
+		description = "How long after a task kill its drop can still arrive and be credited. "
+			+ "Needed for bosses whose loot isn't dropped when they die and has to be collected, "
+			+ "such as Araxxor. Late drops are only credited when they come from a monster already "
+			+ "confirmed as a target of this task, so widening this doesn't pull in stray kills. "
+			+ "Set to 0 to credit only drops that land as the monster dies.",
+		section = lootSection,
+		position = 0
+	)
+	@Range(min = 0, max = 600)
+	default int lootCreditWindow()
+	{
+		return 120;
+	}
+
+	// -------------------------------------------------------------------------
 	// Supplies
 	// -------------------------------------------------------------------------
 
 	@ConfigSection(
 		name = "Supplies",
 		description = "Controls which supply usage gets charged to the task",
-		position = 1
+		position = 2
 	)
 	String suppliesSection = "supplies";
 
