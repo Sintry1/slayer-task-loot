@@ -1,0 +1,103 @@
+package com.slayertaskloot;
+
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+import net.runelite.client.config.ConfigSection;
+import net.runelite.client.config.Range;
+
+@ConfigGroup(SlayerTaskLootConfig.GROUP)
+public interface SlayerTaskLootConfig extends Config
+{
+	String GROUP = "slayertaskloot";
+
+	// -------------------------------------------------------------------------
+	// Display
+	// -------------------------------------------------------------------------
+
+	@ConfigSection(
+		name = "Display",
+		description = "What the side panel shows",
+		position = 0
+	)
+	String displaySection = "display";
+
+	@ConfigItem(
+		keyName = "profitMode",
+		name = "Value shown",
+		description = "Gross drop value: total GE value of everything the task dropped.<br>"
+			+ "Net profit after supplies: the same figure minus supplies used while on task.",
+		section = displaySection,
+		position = 0
+	)
+	default ProfitMode profitMode()
+	{
+		return ProfitMode.NET;
+	}
+
+	@ConfigItem(
+		keyName = "showItemValues",
+		name = "Show item values",
+		description = "Show the GE value alongside each item's quantity",
+		section = displaySection,
+		position = 1
+	)
+	default boolean showItemValues()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "historySize",
+		name = "Tasks to remember",
+		description = "How many completed tasks to keep in the History tab. Set to 0 to keep none.",
+		section = displaySection,
+		position = 2
+	)
+	@Range(min = 0, max = 50)
+	default int historySize()
+	{
+		return 10;
+	}
+
+	// -------------------------------------------------------------------------
+	// Supplies
+	// -------------------------------------------------------------------------
+
+	@ConfigSection(
+		name = "Supplies",
+		description = "Controls which supply usage gets charged to the task",
+		position = 1
+	)
+	String suppliesSection = "supplies";
+
+	@ConfigItem(
+		keyName = "sessionTimeout",
+		name = "End session after (minutes)",
+		description = "A session stays open while task kills keep happening. After this long with "
+			+ "no credited kill it closes, and supplies stop counting toward the task until the "
+			+ "next kill. Keeps unrelated activity off the task's bill.",
+		section = suppliesSection,
+		position = 0
+	)
+	@Range(min = 1, max = 60)
+	default int sessionTimeout()
+	{
+		return 5;
+	}
+
+	@ConfigItem(
+		keyName = "graceWindow",
+		name = "Grace window (seconds)",
+		description = "Supplies used this long before a session opens still count, so teleports "
+			+ "out and boosts drunk before the first kill are included. Set to 0 to count only "
+			+ "from the first credited kill onward.",
+		section = suppliesSection,
+		position = 1
+	)
+	@Range(min = 0, max = 300)
+	default int graceWindow()
+	{
+		return 30;
+	}
+}
