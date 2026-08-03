@@ -19,10 +19,31 @@ Drops are attributed using the slayer counter itself: a kill is credited to the 
 - **Konar tasks** only count kills made in the assigned area, exactly as the game does
 - Stray kills of things that aren't your task are ignored
 
-### Net profit after supplies
-Optionally shows profit rather than gross drop value, subtracting what you used getting the kills. Supply cost is measured by diffing your **inventory, worn equipment and rune pouch** and charging the net loss in GE value — one rule that covers food, potions, runes, ammunition, cannonballs and teleports at once, with no item table to keep up to date.
+Drops are recorded when the monster **drops** them, not when you pick them up — the event comes from the game's own drop-log script. Leave loot on the ground and it still counts.
 
-Dose-based potions come out right for free: drinking a 4-dose is one item id decreasing and another increasing, so the net change is the cost of exactly one dose. The vial returned at the end nets the same way.
+### Loot you have to collect
+Some monsters don't drop loot as they die; Araxxor leaves it to be gathered afterwards. A **late loot window** (2 minutes by default) keeps the task open so those drops still land on it, including when the kill was the one that finished the assignment.
+
+Late drops are only credited when they come from a monster already **confirmed as a target of this task** — learned by watching what dies on the ticks the slayer counter moves. Kill credit is recorded per tick rather than per NPC, so without that name check a wide window would sweep up any drop that happened to land inside it. With it, widening the window doesn't pull in stray kills.
+
+### Net profit after supplies
+Optionally shows profit rather than gross drop value, subtracting what you used getting the kills, with a breakdown of what went:
+
+```
+Drops                    1.4M gp
+Supplies                -412k gp
+   Prayer potion  x14 doses    210k gp
+   Adamant bolts  x820          98k gp
+   Shark          x22           77k gp
+   Varrock teleport x3          27k gp
+Profit                   988k gp
+```
+
+Supply cost is measured by diffing your **inventory, worn equipment and rune pouch** and charging the loss in GE value — one rule that covers food, potions, runes, ammunition, cannonballs and teleports at once, with no item table to keep up to date.
+
+Losses are totalled per item family, so **dose-based potions are counted in doses, not bottles**. Drinking one dose is a 4-dose leaving and a 3-dose arriving, which costs the difference between the two rather than a whole potion. Fourteen sips read as `x14 doses`, not `x14 Prayer potion(4)`. The vial returned by the last dose nets the same way.
+
+The breakdown always sums to the total beside it, because both come from the same per-family diff.
 
 Item movement that can't be consumption is re-baselined instead of charged, so none of the following show up as supply cost:
 
@@ -54,6 +75,12 @@ Completed tasks are kept per character and reloaded on login, with a configurabl
 | Show item values | On | Show the GE value next to each item's quantity |
 | Tasks to remember | 10 | How many completed tasks to keep in History (0–50) |
 
+### Loot
+
+| Setting | Default | Description |
+|---|---|---|
+| Late loot window (seconds) | 120 | How long after a task kill its drop can still arrive and be credited, for monsters whose loot has to be collected (0–600). 0 credits only drops that land as the monster dies |
+
 ### Supplies
 
 | Setting | Default | Description |
@@ -69,7 +96,9 @@ Item charges leave no trace in inventory or equipment state, so they can't be se
 - Ruinous Powers
 - Cannon setup
 
-Items with no GE price — most untradeables, including crystal equipment — are valued at zero. And if a loot pickup and a potion sip land in the same game tick they partially cancel out, which errs toward under-charging rather than inventing a cost.
+Items with no GE price — most untradeables, including crystal equipment — are valued at zero, so they cost nothing.
+
+**Slayer chest loot is out of scope by design.** Brimstone Chest and Larran's chests aren't monster drops — the game treats them as separate chest events — so their contents don't appear here. The keys themselves are untradeable and price at zero. Track those with the built-in Loot Tracker, which records them as their own entries.
 
 ## Dependencies
 
