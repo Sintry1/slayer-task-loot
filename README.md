@@ -1,108 +1,116 @@
 # Slayer Task Loot
 
-A RuneLite plugin that tracks the loot from your current slayer task on its own, so you can see what a task earned without resetting your lifetime loot history for that monster.
+Tracks the loot from your current slayer task on its own, so you can see what a task earned without wiping your lifetime loot history for that monster.
 
-The built-in Loot Tracker only offers per-monster **Reset** and **Reset All**, and stores one cumulative total per NPC. Seeing "what did this task give me" there means wiping everything you've ever recorded for that monster. This keeps a separate, per-task tally alongside it, and optionally subtracts the supplies you burned getting it.
+The built-in Loot Tracker only stores one running total per NPC, so answering "what did this task give me" means resetting everything you've ever recorded for it. This keeps a separate per-task tally alongside it, and can subtract the supplies you used.
 
-## Features
+## What it does
 
-### Per-task loot
-- One record per assignment, with a running total of every drop credited to it
-- Items listed highest-value first, with quantity and GE value
+- One record per task, with every drop credited to it, highest value first
 - Kill count and time actually spent on task
+- Only counts kills that belong to your task — superior monsters and boss variants count, Konar tasks only count kills in the assigned area, and stray kills are ignored
+- Keeps the task open for a couple of minutes after the last kill so loot you have to collect, like Araxxor's, still lands on it
+- Optional profit after supplies, with a breakdown of what you spent
+- History of completed tasks, kept per character and reloaded on login
 
-### Only kills that counted
-Drops are attributed using the slayer counter itself: a kill is credited to the task only when `SLAYER_COUNT` decrements. That means the tally automatically gets the awkward cases right, with no monster-name lists to maintain:
+A task in progress survives logging out, world hopping and toggling the plugin off.
 
-- **Superior slayer monsters** count, because the game credits them
-- **Boss-variant tasks** count (Kree'arra on an Aviansies task, Vorkath on Blue dragons)
-- **Konar tasks** only count kills made in the assigned area, exactly as the game does
-- Stray kills of things that aren't your task are ignored
+## Profit after supplies
 
-Drops are recorded when the monster **drops** them, not when you pick them up — the event comes from the game's own drop-log script. Leave loot on the ground and it still counts.
-
-### Loot you have to collect
-Some monsters don't drop loot as they die; Araxxor leaves it to be gathered afterwards. A **late loot window** (2 minutes by default) keeps the task open so those drops still land on it, including when the kill was the one that finished the assignment.
-
-Late drops are only credited when they come from a monster already **confirmed as a target of this task** — learned by watching what dies on the ticks the slayer counter moves. Kill credit is recorded per tick rather than per NPC, so without that name check a wide window would sweep up any drop that happened to land inside it. With it, widening the window doesn't pull in stray kills.
-
-### Net profit after supplies (optional)
-Entirely opt-out via **Track supplies and profit**. Switch it off and the plugin is a pure drop tracker: no supply measurement happens at all and the panel reports gross GE value only. Switch it on and profit is shown after supplies, with a breakdown of what went:
+Optional, and off-switchable — turn off **Track supplies and profit** and it becomes a pure drop tracker with no measurement at all.
 
 ```
-Drops                    1.4M gp
-Supplies                -412k gp
-   Prayer potion  x14 doses    210k gp
-   Adamant bolts  x820          98k gp
-   Shark          x22           77k gp
-   Varrock teleport x3          27k gp
-Profit                   988k gp
+▾ Drops                        1.4M gp
+    <your drops>
+▾ Supplies                    -412k gp
+    Prayer potion   x14 doses    210k
+    Toxic blowpipe  x820         98k
+    Shark           x22          77k
+    Varrock teleport x3          27k
+Profit                          988k gp
 ```
 
-Supply cost is measured by diffing your **inventory, worn equipment and rune pouch** and charging the loss in GE value — one rule that covers food, potions, runes, ammunition, cannonballs and teleports at once, with no item table to keep up to date.
+Supplies are measured from your inventory, worn equipment and rune pouch, so food, potions, runes, ammunition and teleports are all covered (assuming a session is in progress) without a list of items to maintain. Potions are counted in **doses**, not bottles.
 
-Losses are totalled per item family, so **dose-based potions are counted in doses, not bottles**. Drinking one dose is a 4-dose leaving and a 3-dose arriving, which costs the difference between the two rather than a whole potion. Fourteen sips read as `x14 doses`, not `x14 Prayer potion(4)`. The vial returned by the last dose nets the same way.
+Charged weapons appear as a single row named after the weapon. Hover it to see what its charges cost.
 
-The breakdown always sums to the total beside it, because both come from the same per-family diff.
+Things that aren't consumption don't get charged: banking, shops, trades, the Grand Exchange, dying, dropping an item, or setting up and picking up a cannon.
 
-Item movement that can't be consumption is re-baselined instead of charged, so none of the following show up as supply cost:
+By default, drops and supplies of the same item cancel out — five sharks dropped and two eaten shows three sharks and no shark cost. Turn off **Net matching drops** to see both.
 
-- Banking, deposit boxes, shops, trades and the Grand Exchange
-- Dying and losing your inventory
-- Explicitly dropping an item
+Supplies only count while a session is open. A session starts on your first credited kill, stays open while kills keep happening, and closes after an idle timeout — so an unrelated boss trip doesn't land on your task's bill. There's a grace window before the first kill so your teleport out and pre-fight boosts still count. You can also start, end, resume and merge sessions from the panel manually.
 
-### Sessions
-Supplies have no equivalent of the kill counter — nothing in game state says a potion was drunk *for the task*. Charging everything while a task is open would put an unrelated boss trip on the task's bill, so usage is attributed by session instead:
+## Charged items
 
-- A session **opens** on a credited kill
-- It **stays open** while kills keep happening
-- It **closes** after the configured idle timeout, or when the task changes
+| Item | Cost counted |
+|---|---|
+| Scythe of Vitur | 2 blood runes and 1/100 vial of blood per attack |
+| Tumeken's shadow | 2 soul and 5 chaos runes per cast |
+| Sanguinesti staff | 2 blood runes per cast |
+| Trident of the seas | 1 chaos, 1 death, 5 fire runes and 10 gp per cast |
+| Trident of the swamp | 1 chaos, 1 death, 5 fire runes and 1 Zulrah's scale per cast |
+| Warped sceptre | 2 chaos and 5 earth runes per cast |
+| Venator bow | 1 ancient essence per shot |
+| Eye of ayak | 1 demon tear, or 2 death and 1 chaos runes, per cast |
+| Abyssal tentacle | 1 abyssal whip per 10,000 attacks |
+| Toxic blowpipe | darts at your Ava's device's rate, and 2 Zulrah's scales per 3 attacks |
+| Tome of fire, water, earth | 1 page per 20 casts |
+| Dizana's quiver | 1 sunfire splinter per 3 shots |
+| Dwarf multicannon | 1 cannonball per shot |
 
-Supplies only count while a session is open, plus a **grace window** before it opens so the teleport out and the boost drunk before the first kill are included.
+Confirmed working in game: scythe, Tumeken's shadow, sanguinesti staff, trident of the seas, venator bow, eye of ayak, abyssal tentacle, toxic blowpipe, tome of fire, Dizana's quiver, cannonballs, arrows and bolts, and runes from both the inventory and a rune pouch.
 
-Each task shows its **session count** and **on-task time** so the attribution can be checked against what you actually did, rather than taken on trust.
+Implemented but not yet confirmed in game: trident of the swamp, enchanted trident of the seas, warped sceptre, tomes of water and earth, and the eye of ayak's special attack.
 
-### History
-Completed tasks are kept per character and reloaded on login, with a configurable number to remember. A task in progress survives logging out, world hopping and toggling the plugin.
+## Caveats
 
-## Configuration
+**Some costs are averages, not measurements.** Blowpipe scales, Dizana's quiver splinters and blowpipe darts are all consumed randomly, so they're billed at their long-run rate. Over a full task these land close to reality; over a dozen attacks they won't match what the item's charge counter actually did. That's expected, not a fault.
+
+**Recharging an item mid-task is billed twice** — once for the runes or scales leaving your inventory, and again as the charges get used. Recharge at a bank, where restocking isn't counted at all, and it's billed once.
+
+**Blowpipe darts need the blowpipe checked once per login** before they can be counted, since that's the only time the game says which dart is loaded. Set **Blowpipe dart** in the config to skip that.
+
+**Untradeable items are worth 0 gp**, so crystal equipment and similar cost nothing.
+
+**Not tracked:** serpentine helm and toxic staff of the dead. Both spend scales by time in combat rather than per attack, which isn't reliably measurable.
+
+**Slayer chests aren't included.** Brimstone and Larran's chest contents aren't monster drops, so they don't appear here — the built-in Loot Tracker records those separately.
+
+## Settings
 
 ### Display
 
 | Setting | Default | Description |
 |---|---|---|
-| Show item values | On | Show the GE value next to each item's quantity |
-| Tasks to remember | 10 | How many completed tasks to keep in History (0–50) |
+| Show item values | On | Show each item's value next to its quantity |
+| Tasks to remember | 10 | How many finished tasks to keep in History (0–50) |
 
 ### Loot
 
 | Setting | Default | Description |
 |---|---|---|
-| Late loot window (seconds) | 120 | How long after a task kill its drop can still arrive and be credited, for monsters whose loot has to be collected (0–600). 0 credits only drops that land as the monster dies |
+| Count loot | Dropped | Count every drop, or only what reaches your inventory |
+| Late loot window | 120s | How long after a kill its drop can still count, for bosses whose loot has to be collected (0–600) |
 
 ### Supplies
 
 | Setting | Default | Description |
 |---|---|---|
-| Track supplies and profit | On | Off makes this a pure drop tracker — no supply measurement at all, gross value only. The two settings below have no effect when off |
-| End session after (minutes) | 5 | Idle time with no credited kill before supplies stop counting toward the task (1–60) |
-| Grace window (seconds) | 30 | How far before a session opens supplies still count, for teleports and pre-fight boosts (0–300) |
+| Track supplies and profit | On | Off makes this a pure drop tracker |
+| Net matching drops | On | Cancel drops against supplies of the same item |
+| End session after | 10 min | Idle time before supplies stop counting toward the task (1–60) |
+| Grace window | 30s | How long before your first kill supplies still count (0–300) |
 
-## What it doesn't track
+### Charged items
 
-Item charges leave no trace in inventory or equipment state, so they can't be seen by this approach and are **not** counted as supply cost:
+For items the game gives no way to identify. Each defaults to reading it from the message shown when you fill the item.
 
-- Blowpipe scales, powered staves and tridents
-- Ruinous Powers
-- Cannon setup
-
-Items with no GE price — most untradeables, including crystal equipment — are valued at zero, so they cost nothing.
-
-**Slayer chest loot is out of scope by design.** Brimstone Chest and Larran's chests aren't monster drops — the game treats them as separate chest events — so their contents don't appear here. The keys themselves are untradeable and price at zero. Track those with the built-in Loot Tracker, which records them as their own entries.
-
-## Dependencies
-
-None. Slayer state is read from the game's own varps and loot from `ServerNpcLoot`, so there's no `@PluginDependency` on the Slayer or Loot Tracker plugins and nothing breaks if either is switched off.
+| Setting | Description |
+|---|---|
+| Eye of ayak | Demon tears, or death and chaos runes |
+| Blowpipe dart | Which dart is loaded |
+| Cannonball | Regular or granite |
+| Tome of fire page | Burnt or searing — the game gives no way to tell these apart, so this one has no automatic option |
 
 ## License
 

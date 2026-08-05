@@ -2,6 +2,7 @@ package com.slayertaskloot;
 
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import lombok.Value;
 
 /**
@@ -38,5 +39,31 @@ class SupplyCharge
 		int quantity;
 		long value;
 		boolean doseBased;
+
+		/**
+		 * What one use of a charged item cost, as component itemId -> quantity, or empty for an
+		 * ordinary supply.
+		 *
+		 * <p>When present, {@link #itemId} is the charged item itself and {@link #quantity} counts
+		 * its uses, so the row reads "Scythe of Vitur, 400 attacks" with the blood runes and vials
+		 * behind it rather than as separate supplies. Grouping them keeps a weapon's running cost
+		 * as one line that can be compared against the drops, instead of scattering it across
+		 * rune rows that look like spellcasting.
+		 */
+		Map<Integer, Integer> components;
+
+		Row(int itemId, int quantity, long value, boolean doseBased)
+		{
+			this(itemId, quantity, value, doseBased, Collections.emptyMap());
+		}
+
+		Row(int itemId, int quantity, long value, boolean doseBased, Map<Integer, Integer> components)
+		{
+			this.itemId = itemId;
+			this.quantity = quantity;
+			this.value = value;
+			this.doseBased = doseBased;
+			this.components = components;
+		}
 	}
 }
