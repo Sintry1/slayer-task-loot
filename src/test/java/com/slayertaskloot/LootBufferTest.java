@@ -82,4 +82,15 @@ public class LootBufferTest
 		assertEquals(0, SlayerTaskLootPlugin.removedGroundQuantity(100, 100));
 		assertEquals(0, SlayerTaskLootPlugin.removedGroundQuantity(100, -1));
 	}
+
+	@Test
+	public void recognisesAlchemySpellTargets()
+	{
+		assertEquals(true, SlayerTaskLootPlugin.isAlchemyCast(
+			"Cast", "High Level Alchemy -> Rune platebody"));
+		assertEquals(true, SlayerTaskLootPlugin.isAlchemyCast(
+			"cast", "Low Level Alchemy -> Yew longbow"));
+		assertEquals(false, SlayerTaskLootPlugin.isAlchemyCast("Use", "High Level Alchemy"));
+		assertEquals(false, SlayerTaskLootPlugin.isAlchemyCast("Cast", "Fire Blast"));
+	}
 }

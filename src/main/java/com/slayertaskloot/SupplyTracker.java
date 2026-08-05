@@ -297,11 +297,10 @@ class SupplyTracker
 			{
 				continue;
 			}
-			if (delta < 0 && isPrayerRemains(id))
+			if (delta < 0 && isLootOnlyItem(id))
 			{
-				// Burying bones and scattering ashes grants Prayer experience, but these
-				// drops are loot rather than task supplies. Never let their removal create
-				// a supply row which the default netting view would cancel against loot.
+				// Prayer remains and ensouled heads are loot rather than task supplies.
+				// Never let their removal create a row which netting cancels against loot.
 				continue;
 			}
 
@@ -529,13 +528,13 @@ class SupplyTracker
 		return false;
 	}
 
-	boolean isPrayerRemains(int itemId)
+	boolean isLootOnlyItem(int itemId)
 	{
 		try
 		{
 			final ItemComposition comp = itemManager.getItemComposition(itemId);
 			return comp != null && (hasPrayerRemainsAction(comp.getInventoryActions())
-				|| isPrayerRemainsName(comp.getName()));
+				|| isLootOnlyName(comp.getName()));
 		}
 		catch (Exception ex)
 		{
@@ -560,14 +559,15 @@ class SupplyTracker
 		return false;
 	}
 
-	static boolean isPrayerRemainsName(String name)
+	static boolean isLootOnlyName(String name)
 	{
 		if (name == null)
 		{
 			return false;
 		}
 		final String lower = name.toLowerCase(java.util.Locale.ROOT);
-		return lower.endsWith(" ashes") || lower.endsWith(" bones");
+		return lower.endsWith(" ashes") || lower.endsWith(" bones")
+			|| (lower.startsWith("ensouled ") && lower.endsWith(" head"));
 	}
 
 	Map<Integer, Integer> takeRunePouchSnapshot()
