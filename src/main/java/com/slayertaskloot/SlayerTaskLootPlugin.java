@@ -4,14 +4,11 @@ import com.google.gson.Gson;
 import com.google.gson.JsonSyntaxException;
 import com.google.gson.reflect.TypeToken;
 import com.google.inject.Provides;
-import java.awt.Color;
-import java.awt.Font;
-import java.awt.Graphics2D;
-import java.awt.RenderingHints;
 import java.awt.image.BufferedImage;
 import java.lang.reflect.Type;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
@@ -19,44 +16,58 @@ import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import javax.annotation.Nullable;
 import javax.inject.Inject;
 import javax.swing.SwingUtilities;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
+import net.runelite.api.ChatMessageType;
+import net.runelite.api.EquipmentInventorySlot;
 import net.runelite.api.GameState;
 import net.runelite.api.ItemComposition;
 import net.runelite.api.NPC;
 import net.runelite.api.NPCComposition;
 import net.runelite.api.events.ActorDeath;
+import net.runelite.api.events.AnimationChanged;
+import net.runelite.api.events.ChatMessage;
 import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.GameTick;
+import net.runelite.api.events.GraphicChanged;
 import net.runelite.api.events.ItemContainerChanged;
 import net.runelite.api.events.MenuOptionClicked;
 import net.runelite.api.events.NpcDespawned;
 import net.runelite.api.events.VarbitChanged;
 import net.runelite.api.events.WidgetClosed;
 import net.runelite.api.events.WidgetLoaded;
+import net.runelite.api.Skill;
+import net.runelite.api.gameval.AnimationID;
 import net.runelite.api.gameval.DBTableID;
 import net.runelite.api.gameval.InterfaceID;
 import net.runelite.api.gameval.InventoryID;
+import net.runelite.api.gameval.ItemID;
 import net.runelite.api.gameval.VarPlayerID;
 import net.runelite.api.gameval.VarbitID;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.events.NpcLootReceived;
 import net.runelite.client.events.ServerNpcLoot;
 import net.runelite.client.game.ItemManager;
+import net.runelite.client.game.SkillIconManager;
 import net.runelite.client.game.ItemStack;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.ui.ClientToolbar;
 import net.runelite.client.ui.NavigationButton;
+import net.runelite.client.util.QuantityFormatter;
 import net.runelite.client.util.Text;
 
 /**
@@ -111,6 +122,130 @@ public class SlayerTaskLootPlugin extends Plugin
 
 	/** Refresh the panel at most this often. Supply charges fire far too fast to rebuild on each. */
 	private static final int PANEL_REFRESH_INTERVAL_TICKS = 5;
+	private static final Pattern BLOWPIPE_DARTS_PATTERN = Pattern.compile(
+		"Darts: (.+) x [0-9,]+\\. Scales: .+\\.");
+	private static final Pattern CANNON_LOAD_PATTERN = Pattern.compile(
+		"(?i).*load(?:ed)?(?: the cannon)? with ([0-9,]+) (granite )?cannonballs?.*");
+	private static final Pattern CANNON_UNLOAD_PATTERN = Pattern.compile(
+		"You unload your cannon and receive (Granite cannonball|Cannonball).*");
+
+	private static final int BLOWPIPE_ATTACK_ANIMATION = 5061;
+	private static final int TENTACLE_ATTACK_ANIMATION = AnimationID.SLAYER_ABYSSAL_WHIP_ATTACK;
+	private static final int VENATOR_ATTACK_ANIMATION = AnimationID.HUMAN_WEAPON_BOW_VENATOR01_SHOOT;
+
+	/** Attacks a whip is worth once a kraken tentacle is attached to it. */
+	private static final int TENTACLE_CHARGES = 10_000;
+
+	/**
+	 * Percentage of darts a blowpipe shot actually uses up, by ammunition-saving device. Ava's
+	 * devices recover blowpipe darts at 60%, 72% and 80% respectively, so what's spent is the
+	 * remainder. A quiver upgraded at Ava is treated as an assembler; the varbit says the
+	 * upgrade exists but not which device paid for it, and the assembler is the common answer.
+	 */
+	/**
+	 * Ranged weapons a charged quiver spends nothing on: those that pay for their shots from their
+	 * own charges, and those whose ammunition the quiver can't store in the first place.
+	 */
+	private static final Set<Integer> QUIVER_EXEMPT_WEAPONS = new HashSet<>(Arrays.asList(
+		ItemID.VENATOR_BOW, ItemID.VENATOR_BOW_ORNAMENT,
+		ItemID.TOXIC_BLOWPIPE_LOADED, ItemID.TOXIC_BLOWPIPE_LOADED_ORNAMENT,
+		ItemID.BOW_OF_FAERDHINEN, ItemID.BR_BOW_OF_FAERDHINEN,
+		ItemID.TONALZTICS_OF_RALOS_CHARGED, ItemID.TONALZTICS_OF_RALOS_UNCHARGED));
+
+	/**
+	 * Weapon categories that spend quiver charges: bow and crossbow.
+	 *
+	 * <p>The effect applies to "arrows and bolts shot from either ammunition slot", so thrown
+	 * weapons are out — a knife, dart or blisterwood stake is the weapon and its own ammunition, not
+	 * an arrow held in a slot, and the quiver takes nothing for throwing one. Category 19 was
+	 * eligible here at first and billed 19 stakes as if they were arrows.
+	 */
+	private static final Set<Integer> QUIVER_AMMO_CATEGORIES = new HashSet<>(Arrays.asList(3, 5));
+
+	/**
+	 * Ranged attack animations, for counting shots.
+	 *
+	 * <p>Whitelisted rather than taking any animation at all, because being attacked is an animation
+	 * too: a bow shot is 426 and the defence animation between shots is 424, and counting both put
+	 * the shot count 19% over on a sixteen-shot trip. A weapon whose animation is missing from here
+	 * is logged rather than silently skipped, so the gap shows up as a line in the log instead of as
+	 * an undercount nobody can explain.
+	 */
+	private static final Set<Integer> RANGED_ATTACK_ANIMATIONS = new HashSet<>(Arrays.asList(
+		// Confirmed in game: a bow and a crossbow.
+		AnimationID.HUMAN_BOW,
+		AnimationID.XBOWS_HUMAN_FIRE_AND_RELOAD_PVN,
+		// The rest of each family. Unconfirmed, but every one is an attack animation, so a wrong
+		// guess costs nothing — it is an id that never appears. Missing ones announce themselves in
+		// the log. Thrown animations are absent on purpose: those weapons aren't eligible.
+		AnimationID.XBOWS_HUMAN_FIRE_AND_RELOAD,
+		AnimationID.BALLISTA_ATTACK,
+		AnimationID.HUMAN_CROSSBOW));
+
+	private static final int EYE_OF_AYAK_ANIMATION = 12397;
+
+	/**
+	 * Elemental tomes, as {tome item id, page item id, spell graphics...}.
+	 *
+	 * <p>A tome is a shield and has no animation of its own, so a cast is recognised by the spell's
+	 * own graphic appearing on the player while the tome is worn — one graphic per spell tier. All
+	 * three work identically: 20 charges to a page, one charge to a cast. The fire tome's page is
+	 * taken from config instead of this table, since it accepts two.
+	 */
+	private static final int[][] ELEMENTAL_TOMES = {
+		{ItemID.TOME_OF_FIRE, -1, 99, 126, 129, 155, 1464},
+		{ItemID.TOME_OF_WATER, ItemID.SOAKED_PAGE, 93, 120, 135, 161, 1458},
+		{ItemID.TOME_OF_EARTH, ItemID.SOILED_PAGE, 96, 123, 138, 164, 1461},
+	};
+
+	/** Shots per splinter: whether a quiver spends one is a 1-in-3 roll. */
+	private static final int SHOTS_PER_SPLINTER = 3;
+
+	/** Scales spent per three attacks: the blowpipe has a 1-in-3 chance to spend none. */
+	private static final int SCALES_PER_THREE_SHOTS = 2;
+
+	/**
+	 * Attack animations a powered staff casts with. Two of them, because the older staves kept the
+	 * generic high-level magic animation when the newer ones were given their own.
+	 */
+	private static final int POWERED_STAFF_ANIMATION = 1167;
+	private static final int POWERED_STAFF_ANIMATION_ALT = 11430;
+
+	/**
+	 * What one cast from each powered staff consumes, as component itemId/quantity pairs.
+	 *
+	 * <p>Per staff rather than per resource, because the same resource is spent at different rates
+	 * by different items: the swamp trident pays in Zulrah's scales exactly where the seas trident
+	 * pays in coins. Tumeken's shadow is absent because it has its own animation, handled with the
+	 * scythe.
+	 */
+	private static final Map<Integer, int[]> POWERED_STAFF_COSTS = new HashMap<>();
+
+	static
+	{
+		final int[] seas = {ItemID.CHAOSRUNE, 1, ItemID.DEATHRUNE, 1, ItemID.FIRERUNE, 5, ItemID.COINS, 10};
+		final int[] swamp = {ItemID.CHAOSRUNE, 1, ItemID.DEATHRUNE, 1, ItemID.FIRERUNE, 5,
+			ItemID.SNAKEBOSS_SCALE, 1};
+		for (int id : new int[]{ItemID.TOTS, ItemID.TOTS_CHARGED, ItemID.TOTS_ORN,
+			ItemID.TOTS_CHARGED_ORN, ItemID.TOTS_I_CHARGED, ItemID.TOTS_I_CHARGED_ORN})
+		{
+			POWERED_STAFF_COSTS.put(id, seas);
+		}
+		for (int id : new int[]{ItemID.TOXIC_TOTS_CHARGED, ItemID.TOXIC_TOTS_CHARGED_ORN,
+			ItemID.TOXIC_TOTS_I_CHARGED, ItemID.TOXIC_TOTS_I_CHARGED_ORN})
+		{
+			POWERED_STAFF_COSTS.put(id, swamp);
+		}
+		// Two blood runes a cast, not three. The wiki's 20,000 charges from 40,000 runes is the
+		// authority here; Supplies Tracker bills three.
+		POWERED_STAFF_COSTS.put(ItemID.SANGUINESTI_STAFF, new int[]{ItemID.BLOODRUNE, 2});
+		POWERED_STAFF_COSTS.put(ItemID.WARPED_SCEPTRE, new int[]{ItemID.CHAOSRUNE, 2, ItemID.EARTHRUNE, 5});
+	}
+
+	private static final int LOSS_WITH_NO_DEVICE = 100;
+	private static final int LOSS_WITH_ATTRACTOR = 40;
+	private static final int LOSS_WITH_ACCUMULATOR = 28;
+	private static final int LOSS_WITH_ASSEMBLER = 20;
 
 	@Inject
 	private Client client;
@@ -134,6 +269,9 @@ public class SlayerTaskLootPlugin extends Plugin
 	private SupplyTracker supplyTracker;
 
 	@Inject
+	private SkillIconManager skillIconManager;
+
+	@Inject
 	private Gson gson;
 
 	private SlayerTaskLootPanel panel;
@@ -152,11 +290,16 @@ public class SlayerTaskLootPlugin extends Plugin
 	 */
 	private final Set<String> confirmedTargets = new HashSet<>();
 
-	/** Recently deceased NPC name -> tick, held briefly so it can be matched against a credit. */
-	private final Map<String, Integer> recentDeaths = new HashMap<>();
+	/** Distinct recent NPC deaths, keyed by NPC index so barrage kills never collapse together. */
+	private final Map<Integer, RecentDeath> recentDeaths = new HashMap<>();
+	private final Map<Integer, Integer> creditedNpcDeathTicks = new HashMap<>();
 
 	/** Loot awaiting attribution, held one tick so the counter change has time to land. */
 	private final Deque<PendingLoot> pendingLoot = new ArrayDeque<>();
+	private final Deque<PendingCollectedDrop> pendingCollectedDrops = new ArrayDeque<>();
+	private final Deque<InventoryGain> pendingInventoryGains = new ArrayDeque<>();
+	private Map<Integer, Integer> collectionInventorySnapshot;
+	private boolean collectionInventoryDirty;
 
 	/** Supply charges made while no session was open, replayed if one opens within the grace window. */
 	private final Deque<BufferedCharge> graceBuffer = new ArrayDeque<>();
@@ -176,13 +319,26 @@ public class SlayerTaskLootPlugin extends Plugin
 	private boolean historyViewsDirty = true;
 
 	private boolean sessionOpen;
+	private String activeSessionId;
+	private String lastCreditSessionId;
 	private int lastCreditTick = -1;
 
 	/** Tick the counter reached zero, or -1. Keeps a finished task open for its late loot. */
 	private int taskEndTick = -1;
-	private boolean supplyDirty;
+	private boolean supplyResyncPending;
 	private boolean persistDirty;
 	private boolean panelDirty;
+	private int lastWeaponUsageTick = -1;
+	private int lastWeaponUsageAnimation = -1;
+	private long scytheVialRemainder;
+	private int loadedBlowpipeDartId = -1;
+	private int blowpipeDartRemainder;
+	private int blowpipeScaleRemainder;
+	private int quiverShotTick = -1;
+	private int quiverSplinterRemainder;
+	private final Map<Integer, Long> tomeRemainders = new HashMap<>();
+	private int specialEnergyLastSeen = -1;
+	private long tentacleRemainder;
 
 	@Provides
 	SlayerTaskLootConfig provideConfig(ConfigManager configManager)
@@ -208,7 +364,9 @@ public class SlayerTaskLootPlugin extends Plugin
 			if (client.getGameState() == GameState.LOGGED_IN)
 			{
 				load();
+				applyChargeConfig();
 				supplyTracker.resync();
+				resyncCollectionInventory();
 				updateTask();
 			}
 		});
@@ -221,6 +379,7 @@ public class SlayerTaskLootPlugin extends Plugin
 		// would run it after the fields below are nulled and persist an empty task, throwing
 		// away an assignment in progress every time the plugin is toggled off. Writing RS
 		// profile config off the client thread is safe — it uses a cached profile key.
+		closeSession("PLUGIN_STOPPED");
 		persist();
 
 		clientToolbar.removeNavigation(navButton);
@@ -231,15 +390,23 @@ public class SlayerTaskLootPlugin extends Plugin
 		lastSlayerCount = -1;
 		lastCreditTick = -1;
 		sessionOpen = false;
-		supplyDirty = false;
+		activeSessionId = null;
+		lastCreditSessionId = null;
 		persistDirty = false;
 		panelDirty = false;
 		taskEndTick = -1;
 		confirmedTargets.clear();
 		recentDeaths.clear();
+		creditedNpcDeathTicks.clear();
 		pendingLoot.clear();
+		pendingCollectedDrops.clear();
+		pendingInventoryGains.clear();
+		collectionInventorySnapshot = null;
+		collectionInventoryDirty = false;
 		graceBuffer.clear();
 		openInterfaces.clear();
+		quiverShotTick = -1;
+		specialEnergyLastSeen = -1;
 		supplyTracker.clear();
 	}
 
@@ -341,7 +508,7 @@ public class SlayerTaskLootPlugin extends Plugin
 			return;
 		}
 
-		creditKills(lastSlayerCount - amount);
+		creditCounterMovement(lastSlayerCount - amount);
 	}
 
 	/**
@@ -364,12 +531,9 @@ public class SlayerTaskLootPlugin extends Plugin
 			return;
 		}
 
-		lastCreditTick = client.getTickCount();
-		openSession();
-
 		if (lastSlayerCount <= MAX_FINISHING_KILLS)
 		{
-			activeTask.addKills(lastSlayerCount);
+			creditCounterMovement(lastSlayerCount);
 		}
 		else
 		{
@@ -488,16 +652,22 @@ public class SlayerTaskLootPlugin extends Plugin
 
 		activeTask = new TaskLootRecord(taskName, taskLocation, initialAmount, System.currentTimeMillis());
 		sessionOpen = false;
+		activeSessionId = null;
+		lastCreditSessionId = null;
 		lastCreditTick = -1;
 		graceBuffer.clear();
 		// Anything still awaiting attribution belonged to the assignment just archived, and
 		// must not land on this one.
 		pendingLoot.clear();
+		pendingCollectedDrops.clear();
+		pendingInventoryGains.clear();
+		resyncCollectionInventory();
 		lastCreditTick = -1;
 		taskEndTick = -1;
 		// Targets are per assignment: what counted for the last task says nothing about this one.
 		confirmedTargets.clear();
 		recentDeaths.clear();
+		creditedNpcDeathTicks.clear();
 		supplyTracker.resync();
 		markDirty();
 
@@ -530,9 +700,9 @@ public class SlayerTaskLootPlugin extends Plugin
 		}
 
 		trimHistory();
+		closeSession("ASSIGNMENT_CHANGED");
 		activeTask = null;
 		taskEndTick = -1;
-		closeSession();
 		markDirty();
 	}
 
@@ -550,12 +720,11 @@ public class SlayerTaskLootPlugin extends Plugin
 	// Kill credit and sessions
 	// ------------------------------------------------------------------
 
-	private void creditKills(int count)
+	private void creditCounterMovement(int progress)
 	{
-		activeTask.addKills(count);
 		lastCreditTick = client.getTickCount();
-		openSession();
-		markDirty();
+		log.debug("Slayer assignment progressed by {}", progress);
+		confirmRecentDeaths(lastCreditTick, progress);
 	}
 
 	/**
@@ -570,7 +739,7 @@ public class SlayerTaskLootPlugin extends Plugin
 		}
 
 		sessionOpen = true;
-		activeTask.openedSession();
+		activeSessionId = activeTask.openNewSession(System.currentTimeMillis(), false).getSessionId();
 
 		final int cutoff = client.getTickCount() - toTicks(config.graceWindow());
 		long replayed = 0;
@@ -578,7 +747,7 @@ public class SlayerTaskLootPlugin extends Plugin
 		{
 			if (charge.tick >= cutoff)
 			{
-				activeTask.addSupplyCharge(charge.charge);
+				activeTask.addSupplyCharge(activeSessionId, charge.charge);
 				replayed += charge.charge.getTotal();
 			}
 		}
@@ -590,7 +759,17 @@ public class SlayerTaskLootPlugin extends Plugin
 
 	private void closeSession()
 	{
+		closeSession("CLOSED");
+	}
+
+	private void closeSession(String reason)
+	{
+		if (sessionOpen && activeTask != null && activeSessionId != null)
+		{
+			activeTask.closeSession(activeSessionId, System.currentTimeMillis(), reason);
+		}
 		sessionOpen = false;
+		activeSessionId = null;
 		graceBuffer.clear();
 	}
 
@@ -612,7 +791,27 @@ public class SlayerTaskLootPlugin extends Plugin
 			? "Unknown"
 			: Text.removeTags(composition.getName());
 
-		pendingLoot.add(new PendingLoot(client.getTickCount(), name, event.getItems()));
+		// LootManager reuses and clears the backing list immediately after posting this event.
+		// Always take our own copy before buffering it for end-of-tick attribution.
+		pendingLoot.add(new PendingLoot(
+			client.getTickCount(), -1, name, event.getItems(), LootSource.SERVER, activeSessionId));
+	}
+
+	@SuppressWarnings("unused")
+	@Subscribe
+	public void onNpcLootReceived(NpcLootReceived event)
+	{
+		if (activeTask == null || event.getNpc() == null)
+		{
+			return;
+		}
+
+		final String name = event.getNpc().getName() == null
+			? "Unknown"
+			: Text.removeTags(event.getNpc().getName());
+		pendingLoot.add(new PendingLoot(
+			client.getTickCount(), event.getNpc().getIndex(), name,
+			event.getItems(), LootSource.GROUND, activeSessionId));
 	}
 
 	/**
@@ -622,27 +821,70 @@ public class SlayerTaskLootPlugin extends Plugin
 	private void resolvePendingLoot()
 	{
 		final int now = client.getTickCount();
+		final Set<PendingLoot> resolved = new HashSet<>();
 
-		for (Iterator<PendingLoot> it = pendingLoot.iterator(); it.hasNext(); )
+		for (PendingLoot loot : pendingLoot)
 		{
-			final PendingLoot loot = it.next();
-			if (loot.tick >= now)
+			if (resolved.contains(loot)
+				|| loot.tick > now - CREDIT_MATCH_TOLERANCE)
 			{
 				continue;
 			}
 
-			if (activeTask != null && isCreditedDrop(loot))
+			PendingLoot counterpart = null;
+			for (PendingLoot candidate : pendingLoot)
 			{
-				for (ItemStack item : loot.items)
+				if (candidate != loot
+					&& !resolved.contains(candidate)
+					&& candidate.source != loot.source
+					&& Math.abs(candidate.tick - loot.tick) <= CREDIT_MATCH_TOLERANCE
+					&& loot.npcName.equals(candidate.npcName))
 				{
-					activeTask.addItem(itemManager.canonicalize(item.getId()), item.getQuantity());
+					counterpart = candidate;
+					break;
 				}
-				markDirty();
-				log.debug("Credited {} drop to task", loot.npcName);
 			}
 
-			it.remove();
+			// Pair one report from each RuneLite source by NPC and timing, even when the
+			// two APIs disagree about the item payload. Matching remains one-to-one, so
+			// two simultaneous barrage kills remain two independent pairs.
+			final PendingLoot accepted = counterpart != null && counterpart.source == LootSource.SERVER
+				? counterpart
+				: loot;
+			final String killSessionId = confirmLootDeath(accepted);
+
+			if (activeTask != null && isCreditedDrop(accepted))
+			{
+				final String sessionId = killSessionId != null
+					? killSessionId
+					: (accepted.sessionId != null ? accepted.sessionId : lastCreditSessionId);
+				for (ItemStack item : accepted.items)
+				{
+					final int itemId = itemManager.canonicalize(item.getId());
+					if (config.lootMode() == LootMode.DROPPED)
+					{
+						activeTask.addItem(sessionId, itemId, item.getQuantity(),
+							(long) itemManager.getItemPrice(itemId) * item.getQuantity());
+					}
+					else
+					{
+						pendingCollectedDrops.add(new PendingCollectedDrop(
+							accepted.tick, sessionId, itemId, item.getQuantity(),
+							itemManager.getItemPrice(itemId)));
+					}
+				}
+				markDirty();
+				log.debug("Credited {} {} drop to task", accepted.source, accepted.npcName);
+			}
+
+			resolved.add(loot);
+			if (counterpart != null)
+			{
+				resolved.add(counterpart);
+			}
 		}
+
+		pendingLoot.removeAll(resolved);
 	}
 
 	/**
@@ -678,7 +920,8 @@ public class SlayerTaskLootPlugin extends Plugin
 			return false;
 		}
 
-		if (sinceCredit <= CREDIT_MATCH_TOLERANCE)
+		if (sinceCredit <= CREDIT_MATCH_TOLERANCE
+			&& SlayerTaskTargets.matches(activeTask.getTaskName(), loot.npcName))
 		{
 			return true;
 		}
@@ -711,34 +954,152 @@ public class SlayerTaskLootPlugin extends Plugin
 
 	private void noteNpcDeath(NPC npc)
 	{
-		if (npc.getName() != null)
+		if (npc.getName() == null || activeTask == null
+			|| !SlayerTaskTargets.matches(activeTask.getTaskName(), npc.getName()))
 		{
-			recentDeaths.put(Text.removeTags(npc.getName()), client.getTickCount());
+			return;
+		}
+
+		final int tick = client.getTickCount();
+		final int npcIndex = npc.getIndex();
+		final Integer creditedTick = creditedNpcDeathTicks.get(npcIndex);
+		if (creditedTick != null && tick - creditedTick <= 20)
+		{
+			return;
+		}
+		final RecentDeath existing = recentDeaths.get(npcIndex);
+		if (existing != null && Math.abs(existing.tick - tick) <= CREDIT_MATCH_TOLERANCE)
+		{
+			return;
+		}
+
+		final boolean interactedWithPlayer = npc.getInteracting() == client.getLocalPlayer()
+			|| (client.getLocalPlayer() != null && client.getLocalPlayer().getInteracting() == npc);
+		final RecentDeath death = new RecentDeath(
+			npcIndex, Text.removeTags(npc.getName()), tick, interactedWithPlayer);
+		recentDeaths.put(npcIndex, death);
+		if (activeTask.getTaskLocation() == null && interactedWithPlayer)
+		{
+			creditEligibleDeath(death);
 		}
 	}
 
 	/** Promotes anything that died alongside a counter change to a confirmed task target. */
+	private void creditEligibleDeath(RecentDeath death)
+	{
+		if (death.credited || activeTask == null
+			|| (activeTask.isCompleted() && taskEndTick >= 0
+				&& Math.abs(death.tick - taskEndTick) > CREDIT_MATCH_TOLERANCE))
+		{
+			return;
+		}
+
+		death.credited = true;
+		creditedNpcDeathTicks.put(death.npcIndex, death.tick);
+		lastCreditTick = death.tick;
+		openSession();
+		lastCreditSessionId = activeSessionId;
+		death.sessionId = activeSessionId;
+		activeTask.addKills(activeSessionId, 1);
+		confirmedTargets.add(death.npcName);
+		markDirty();
+		if (activeTask.isCompleted())
+		{
+			closeSession("ASSIGNMENT_COMPLETED");
+		}
+	}
+
+	private void confirmRecentDeaths(int creditTick, int progress)
+	{
+		int remaining = Math.max(progress, 1);
+		for (RecentDeath death : recentDeaths.values())
+		{
+			if (remaining > 0 && !death.credited
+				&& death.playerRelated
+				&& Math.abs(death.tick - creditTick) <= CREDIT_MATCH_TOLERANCE)
+			{
+				creditEligibleDeath(death);
+				remaining--;
+			}
+		}
+	}
+
+	@Nullable
+	private String confirmLootDeath(PendingLoot loot)
+	{
+		if (activeTask == null
+			|| !SlayerTaskTargets.matches(activeTask.getTaskName(), loot.npcName))
+		{
+			return null;
+		}
+
+		RecentDeath matched = null;
+		if (loot.npcIndex >= 0)
+		{
+			final RecentDeath indexed = recentDeaths.get(loot.npcIndex);
+			if (indexed != null && indexed.npcName.equals(loot.npcName)
+				&& loot.tick - indexed.tick >= -CREDIT_MATCH_TOLERANCE
+				&& loot.tick - indexed.tick <= toTicks(config.lootCreditWindow()))
+			{
+				matched = indexed;
+			}
+		}
+		for (RecentDeath death : recentDeaths.values())
+		{
+			if (matched == null && !death.lootClaimed && death.npcName.equals(loot.npcName)
+				&& loot.tick - death.tick >= -CREDIT_MATCH_TOLERANCE
+				&& loot.tick - death.tick <= toTicks(config.lootCreditWindow())
+				&& (matched == null || death.tick < matched.tick))
+			{
+				matched = death;
+			}
+		}
+		if (matched != null)
+		{
+			if (!matched.credited)
+			{
+				creditEligibleDeath(matched);
+			}
+			matched.lootClaimed = true;
+			return matched.sessionId;
+		}
+
+		// NpcLootReceived identifies the concrete NPC. If its death callback was missed,
+		// create exactly one indexed death token here. ServerNpcLoot has no NPC identity and
+		// therefore must never manufacture a physical kill on its own.
+		if (loot.npcIndex >= 0)
+		{
+			final RecentDeath lootDeath = new RecentDeath(
+				loot.npcIndex, loot.npcName, loot.tick, true);
+			recentDeaths.put(loot.npcIndex, lootDeath);
+			creditEligibleDeath(lootDeath);
+			lootDeath.lootClaimed = true;
+			return lootDeath.sessionId;
+		}
+		return loot.sessionId != null ? loot.sessionId : lastCreditSessionId;
+	}
+
 	private void reconcileTargets(int now)
 	{
-		for (Iterator<Map.Entry<String, Integer>> it = recentDeaths.entrySet().iterator(); it.hasNext(); )
+		for (Iterator<Map.Entry<Integer, RecentDeath>> it = recentDeaths.entrySet().iterator(); it.hasNext(); )
 		{
-			final Map.Entry<String, Integer> death = it.next();
-			final int deathTick = death.getValue();
+			final RecentDeath death = it.next().getValue();
 
-			if (lastCreditTick >= 0 && Math.abs(deathTick - lastCreditTick) <= CREDIT_MATCH_TOLERANCE)
+			if (!death.credited && death.playerRelated && lastCreditTick >= 0
+				&& Math.abs(death.tick - lastCreditTick) <= CREDIT_MATCH_TOLERANCE)
 			{
-				if (confirmedTargets.add(death.getKey()))
-				{
-					log.debug("Confirmed {} as a target of this task", death.getKey());
-				}
-				it.remove();
+				creditEligibleDeath(death);
 			}
-			else if (deathTick < now - CREDIT_MATCH_TOLERANCE)
+			final int retention = death.credited
+				? toTicks(config.lootCreditWindow())
+				: CREDIT_MATCH_TOLERANCE;
+			if (death.tick < now - retention)
 			{
-				// Died without the counter moving — not a task target, at least not this kill.
+				// Credited deaths remain as one-per-NPC loot tokens for the entire late window.
 				it.remove();
 			}
 		}
+		creditedNpcDeathTicks.entrySet().removeIf(entry -> entry.getValue() < now - 20);
 	}
 
 	// ------------------------------------------------------------------
@@ -749,12 +1110,11 @@ public class SlayerTaskLootPlugin extends Plugin
 	@Subscribe
 	public void onItemContainerChanged(ItemContainerChanged event)
 	{
-		final int id = event.getContainerId();
-		if (id == InventoryID.INV || id == InventoryID.WORN)
+		// Supplies aren't scheduled from here: the diff runs every tick regardless. See
+		// processSupplies().
+		if (event.getContainerId() == InventoryID.INV)
 		{
-			// Inventory and worn equipment are diffed together, and both fire their own
-			// event, so defer to the end of the tick and evaluate them as one change.
-			supplyDirty = true;
+			collectionInventoryDirty = true;
 		}
 	}
 
@@ -762,11 +1122,19 @@ public class SlayerTaskLootPlugin extends Plugin
 	@Subscribe
 	public void onMenuOptionClicked(MenuOptionClicked event)
 	{
-		if ("Drop".equals(event.getMenuOption()))
+		if ("Drop".equalsIgnoreCase(Text.removeTags(event.getMenuOption())))
 		{
-			// Thrown away rather than used up.
-			supplyTracker.resync();
-			supplyDirty = false;
+			final net.runelite.api.ItemContainer inventory =
+				client.getItemContainer(InventoryID.INV);
+			final net.runelite.api.Item item = inventory == null
+				? null
+				: inventory.getItem(event.getParam0());
+			if (item != null && item.getId() > 0 && item.getQuantity() > 0)
+			{
+				// Adjust the old baseline before the asynchronous removal instead of trying
+				// to guess which game tick will observe it.
+				supplyTracker.ignoreRemoval(item.getId(), item.getQuantity());
+			}
 		}
 	}
 
@@ -777,8 +1145,7 @@ public class SlayerTaskLootPlugin extends Plugin
 		if (event.getActor() == client.getLocalPlayer())
 		{
 			// Losing an inventory is not a supply cost.
-			supplyTracker.resync();
-			supplyDirty = false;
+			supplyResyncPending = true;
 			return;
 		}
 
@@ -791,13 +1158,531 @@ public class SlayerTaskLootPlugin extends Plugin
 		}
 	}
 
-	private void processSupplies()
+	@SuppressWarnings("unused")
+	@Subscribe
+	public void onAnimationChanged(AnimationChanged event)
 	{
-		if (!supplyDirty)
+		if (!config.trackSupplies() || !sessionOpen || event.getActor() != client.getLocalPlayer())
 		{
 			return;
 		}
-		supplyDirty = false;
+
+		final int animation = client.getLocalPlayer().getAnimation();
+		final int tick = client.getTickCount();
+		if (tick == lastWeaponUsageTick && animation == lastWeaponUsageAnimation)
+		{
+			return;
+		}
+
+		final int weaponId = equippedWeaponId();
+		SupplyCharge charge = SupplyCharge.EMPTY;
+		if (animation == 8056 && isScythe(weaponId))
+		{
+			// A hundred attacks to a vial, so the vial is carried as fractional gp rather than
+			// as a component quantity that would read as zero on every individual attack.
+			final long vialNumerator = itemManager.getItemPrice(ItemID.VIAL_BLOOD) + scytheVialRemainder;
+			final long vialCost = vialNumerator / 100L;
+			scytheVialRemainder = vialNumerator % 100L;
+			charge = supplyTracker.chargedItemUse(weaponId, vialCost, ItemID.BLOODRUNE, 2);
+		}
+		else if (animation == 9493 && weaponId == ItemID.TUMEKENS_SHADOW)
+		{
+			charge = supplyTracker.chargedItemUse(weaponId, 0,
+				ItemID.SOULRUNE, 2, ItemID.CHAOSRUNE, 5);
+		}
+
+		if (!charge.isEmpty())
+		{
+			activeTask.addSupplyCharge(activeSessionId, charge);
+			lastWeaponUsageTick = tick;
+			lastWeaponUsageAnimation = animation;
+			markDirty();
+		}
+	}
+
+	@SuppressWarnings("unused")
+	@Subscribe
+	public void onChatMessage(ChatMessage event)
+	{
+		if (event.getType() != ChatMessageType.GAMEMESSAGE
+			&& event.getType() != ChatMessageType.SPAM)
+		{
+			return;
+		}
+
+		final String message = Text.removeTags(event.getMessage());
+		// The magazine's size is a varp the supply diff reads directly; only the kind of
+		// ammunition in it has to be learned from a message.
+		if (config.cannonballType() == CannonballType.AUTOMATIC)
+		{
+			final Matcher cannonLoad = CANNON_LOAD_PATTERN.matcher(message);
+			if (cannonLoad.matches())
+			{
+				supplyTracker.setLoadedCannonballId(cannonLoad.group(2) == null
+					? ItemID.MCANNONBALL : ItemID.GRANITE_CANNONBALL);
+			}
+			final Matcher cannonUnload = CANNON_UNLOAD_PATTERN.matcher(message);
+			if (cannonUnload.matches())
+			{
+				supplyTracker.setLoadedCannonballId("Cannonball".equals(cannonUnload.group(1))
+					? ItemID.MCANNONBALL : ItemID.GRANITE_CANNONBALL);
+			}
+		}
+
+		final Matcher darts = BLOWPIPE_DARTS_PATTERN.matcher(message);
+		if (darts.find())
+		{
+			loadedBlowpipeDartId = dartId(darts.group(1));
+		}
+		else if (message.startsWith("Darts: None. Scales:"))
+		{
+			loadedBlowpipeDartId = -1;
+		}
+		else if (config.eyeOfAyakCharge() == EyeOfAyakCharge.AUTOMATIC)
+		{
+			if (message.equals("Eye of Ayak has been charged with demon tears"))
+			{
+				supplyTracker.setEyeUsesTears(true);
+			}
+			else if (message.equals("Eye of Ayak has been charged with runes"))
+			{
+				supplyTracker.setEyeUsesTears(false);
+			}
+		}
+	}
+
+	/**
+	 * Applies the configured charge sources for items that can hold more than one.
+	 *
+	 * <p>Each of these is otherwise learned from a chat message, which only says anything at the
+	 * moment the item is filled. A player who charges an eye of ayak or loads a cannon outside
+	 * the session — or before enabling the plugin — leaves that inference with nothing to go on,
+	 * and it then quietly bills the wrong resource for the whole trip. Setting it explicitly is
+	 * the fix; on {@code AUTOMATIC} nothing is imposed and the messages keep deciding.
+	 */
+	private void applyChargeConfig()
+	{
+		if (config.eyeOfAyakCharge() != EyeOfAyakCharge.AUTOMATIC)
+		{
+			supplyTracker.setEyeUsesTears(config.eyeOfAyakCharge() == EyeOfAyakCharge.DEMON_TEARS);
+		}
+		if (config.cannonballType() != CannonballType.AUTOMATIC)
+		{
+			supplyTracker.setLoadedCannonballId(config.cannonballType().getItemId());
+		}
+	}
+
+	/** The configured dart, or whatever the blowpipe's last check message reported. */
+	private int effectiveDartId()
+	{
+		return config.blowpipeDart() == BlowpipeDart.AUTOMATIC
+			? loadedBlowpipeDartId
+			: config.blowpipeDart().getItemId();
+	}
+
+	/**
+	 * Charges per-attack consumption for weapons whose cost can't be read off the carried
+	 * snapshot.
+	 *
+	 * <p>Counted from the attack animation restarting rather than from the item's charge varbit.
+	 * A fast weapon's animation is never cleared between attacks, so the animation's frame
+	 * returning to zero is what marks one attack; {@link #lastWeaponUsageTick} then keeps a
+	 * single attack from also being billed by {@link #onAnimationChanged}.
+	 */
+	private void processRepeatingWeaponUsage(int now)
+	{
+		if (!config.trackSupplies() || !sessionOpen || client.getLocalPlayer() == null
+			|| client.getLocalPlayer().getAnimationFrame() != 0
+			|| now == lastWeaponUsageTick)
+		{
+			return;
+		}
+
+		final int animation = client.getLocalPlayer().getAnimation();
+		final int weaponId = equippedWeaponId();
+
+		if (animation == BLOWPIPE_ATTACK_ANIMATION && isBlowpipe(weaponId))
+		{
+			noteWeaponUsage(now, animation);
+			chargeBlowpipeUse(weaponId);
+		}
+		else if (animation == TENTACLE_ATTACK_ANIMATION && isTentacle(weaponId))
+		{
+			noteWeaponUsage(now, animation);
+			// A tentacle is a whip with a kraken tentacle attached, good for 10,000 attacks. At
+			// the end of them it reverts to the kraken tentacle and the whip is gone, so the whip
+			// is what 10,000 attacks actually cost. Fractional gp is carried between hits so a
+			// long task doesn't round every attack down to nothing.
+			final long numerator = itemManager.getItemPrice(ItemID.ABYSSAL_WHIP) + tentacleRemainder;
+			final long cost = numerator / TENTACLE_CHARGES;
+			tentacleRemainder = numerator % TENTACLE_CHARGES;
+			if (cost > 0)
+			{
+				recordSupplyCharge(supplyTracker.chargedItemUse(weaponId, cost));
+			}
+		}
+		else if ((animation == POWERED_STAFF_ANIMATION || animation == POWERED_STAFF_ANIMATION_ALT)
+			&& POWERED_STAFF_COSTS.containsKey(weaponId))
+		{
+			noteWeaponUsage(now, animation);
+			recordSupplyCharge(
+				supplyTracker.chargedItemUse(weaponId, 0, POWERED_STAFF_COSTS.get(weaponId)));
+		}
+		else if (animation == EYE_OF_AYAK_ANIMATION && weaponId == ItemID.EYE_OF_AYAK)
+		{
+			noteWeaponUsage(now, animation);
+			recordSupplyCharge(supplyTracker.isEyeUsingTears()
+				? supplyTracker.chargedItemUse(weaponId, 0, ItemID.DEMON_TEAR, 1)
+				: supplyTracker.chargedItemUse(weaponId, 0, ItemID.DEATHRUNE, 2, ItemID.CHAOSRUNE, 1));
+		}
+		else if (animation == VENATOR_ATTACK_ANIMATION && isVenatorBow(weaponId))
+		{
+			noteWeaponUsage(now, animation);
+			// One charge, one ancient essence, per shot.
+			recordSupplyCharge(supplyTracker.chargedItemUse(weaponId, 0, ItemID.ANCIENT_ESSENCE, 1));
+		}
+	}
+
+	/**
+	 * Bills the sunfire splinters a charged quiver spends, counted per shot.
+	 *
+	 * <p>A splinter is a 1-in-3 roll per shot, so shots are what has to be counted. An earlier
+	 * version counted the quiver's ammunition falling instead, which is wrong by roughly the
+	 * ammunition-saving rate: measured in game, twelve shots spent four charges but only one arrow,
+	 * because an assembler puts nearly all of it back. Ammunition consumed and shots fired are
+	 * different quantities and only the second one drives the roll.
+	 *
+	 * <p>A shot is the attack animation restarting, as elsewhere in this class. Movement doesn't
+	 * register — walking and running are pose animations, not this field — so an animating player
+	 * holding a bow is attacking with it, give or take the occasional bite of food.
+	 *
+	 * <p>Eligibility is a weapon category that fires quiver-storable ammunition, minus the weapons
+	 * that are exempt: the ones paying out of their own charges, and the ones whose ammunition the
+	 * quiver can't hold at all.
+	 */
+	private void processQuiverSplinters(int now)
+	{
+		if (!config.trackSupplies() || now == quiverShotTick || client.getLocalPlayer() == null
+			|| client.getLocalPlayer().getAnimation() == -1
+			|| client.getLocalPlayer().getAnimationFrame() != 0)
+		{
+			return;
+		}
+
+		final int animation = client.getLocalPlayer().getAnimation();
+
+		// Only a splinter-charged quiver spends them. A blessed one is permanently lit and an
+		// uncharged one has nothing in it.
+		final int cape = equippedCapeId();
+		if (cape != ItemID.DIZANAS_QUIVER_CHARGED && cape != ItemID.DIZANAS_QUIVER_CHARGED_TROUVER)
+		{
+			return;
+		}
+
+		final int category = client.getVarbitValue(VarbitID.COMBAT_WEAPON_CATEGORY);
+		if (!QUIVER_AMMO_CATEGORIES.contains(category)
+			|| QUIVER_EXEMPT_WEAPONS.contains(equippedWeaponId()))
+		{
+			return;
+		}
+
+		if (!RANGED_ATTACK_ANIMATIONS.contains(animation))
+		{
+			return;
+		}
+
+		quiverShotTick = now;
+		quiverSplinterRemainder++;
+		final int splinters = quiverSplinterRemainder / SHOTS_PER_SPLINTER;
+		quiverSplinterRemainder %= SHOTS_PER_SPLINTER;
+		if (splinters > 0)
+		{
+			recordSupplyCharge(
+				supplyTracker.chargedItemUse(cape, 0, ItemID.SUNFIRESPLINTER, splinters));
+		}
+	}
+
+	/**
+	 * Bills a page fraction each time a spell is cast with a matching elemental tome equipped.
+	 *
+	 * <p>One cast spends one of the tome's charges and a page is worth twenty of them, so a
+	 * twentieth of a page is billed per cast and the remainder carried. Supplies Tracker bills a
+	 * whole page per cast, which overstates it twentyfold.
+	 */
+	@SuppressWarnings("unused")
+	@Subscribe
+	public void onGraphicChanged(GraphicChanged event)
+	{
+		if (!config.trackSupplies() || event.getActor() != client.getLocalPlayer())
+		{
+			return;
+		}
+
+		final int shield = equippedShieldId();
+		for (int[] tome : ELEMENTAL_TOMES)
+		{
+			if (tome[0] != shield)
+			{
+				continue;
+			}
+
+			boolean cast = false;
+			for (int g = 2; g < tome.length; g++)
+			{
+				if (client.getLocalPlayer().hasSpotAnim(tome[g]))
+				{
+					cast = true;
+					break;
+				}
+			}
+			if (!cast)
+			{
+				return;
+			}
+
+			// Only the fire tome takes two kinds of page, so only it needs asking about.
+			final int pageId = tome[1] < 0 ? config.tomePage().getItemId() : tome[1];
+			final long carried = tomeRemainders.getOrDefault(tome[0], 0L);
+			final long numerator = itemManager.getItemPrice(pageId) + carried;
+			tomeRemainders.put(tome[0], numerator % TomePage.CHARGES_PER_PAGE);
+			final long cost = numerator / TomePage.CHARGES_PER_PAGE;
+			if (cost > 0)
+			{
+				recordSupplyCharge(supplyTracker.chargedItemUse(tome[0], cost));
+			}
+			return;
+		}
+	}
+
+	private int equippedShieldId()
+	{
+		final net.runelite.api.ItemContainer worn = client.getItemContainer(InventoryID.WORN);
+		if (worn == null)
+		{
+			return -1;
+		}
+		final net.runelite.api.Item[] items = worn.getItems();
+		final int slot = EquipmentInventorySlot.SHIELD.getSlotIdx();
+		return slot < items.length ? items[slot].getId() : -1;
+	}
+
+	/**
+	 * Bills the eye of ayak's special attack, which the animation path can't be trusted to see.
+	 *
+	 * <p>Soul Rend is a slower attack from a charged weapon, and nothing says it is exempt from
+	 * spending a charge — so assuming it is free would undercount every spec. Its animation id
+	 * isn't published anywhere available here, so the spend of special energy is used as the
+	 * signal instead, which is the same event by definition.
+	 *
+	 * <p>This is safe whichever animation the spec plays. If it plays the ordinary attack
+	 * animation, {@link #processRepeatingWeaponUsage} has already billed this tick and marked it,
+	 * and this skips. If it plays its own, nothing billed and this covers it. Neither case can
+	 * double-bill, so the animation id never has to be established.
+	 */
+	private void processSpecialAttackCharges(int now)
+	{
+		final int energy = client.getVarpValue(VarPlayerID.SA_ENERGY);
+		final int previous = specialEnergyLastSeen;
+		specialEnergyLastSeen = energy;
+
+		if (previous < 0 || energy >= previous || !config.trackSupplies()
+			|| now == lastWeaponUsageTick)
+		{
+			return;
+		}
+
+		final int weaponId = equippedWeaponId();
+		if (weaponId != ItemID.EYE_OF_AYAK)
+		{
+			return;
+		}
+
+		noteWeaponUsage(now, -1);
+		recordSupplyCharge(supplyTracker.isEyeUsingTears()
+			? supplyTracker.chargedItemUse(weaponId, 0, ItemID.DEMON_TEAR, 1)
+			: supplyTracker.chargedItemUse(weaponId, 0, ItemID.DEATHRUNE, 2, ItemID.CHAOSRUNE, 1));
+	}
+
+	private void noteWeaponUsage(int tick, int animation)
+	{
+		lastWeaponUsageTick = tick;
+		lastWeaponUsageAnimation = animation;
+	}
+
+	/**
+	 * Bills one blowpipe attack: the darts it wore out and the scales it burned.
+	 *
+	 * <p>Both are fractional per shot — darts by the ammunition-saving device, scales by the
+	 * blowpipe's own 1-in-3 chance to spend nothing — so each is accumulated and spent whole. The
+	 * attack is always recorded even when it rounded to nothing, so the row's use count is the
+	 * number of attacks rather than the number that happened to tip a counter over.
+	 */
+	private void chargeBlowpipeUse(int weaponId)
+	{
+		blowpipeDartRemainder += dartLossPercent();
+		final int darts = blowpipeDartRemainder / 100;
+		blowpipeDartRemainder %= 100;
+
+		blowpipeScaleRemainder += SCALES_PER_THREE_SHOTS;
+		final int scales = blowpipeScaleRemainder / 3;
+		blowpipeScaleRemainder %= 3;
+
+		final int dartId = effectiveDartId();
+		recordSupplyCharge(dartId > 0
+			? supplyTracker.chargedItemUse(weaponId, 0,
+				dartId, darts, ItemID.SNAKEBOSS_SCALE, scales)
+			: supplyTracker.chargedItemUse(weaponId, 0, ItemID.SNAKEBOSS_SCALE, scales));
+	}
+
+	private int dartLossPercent()
+	{
+		final int cape = equippedCapeId();
+
+		switch (cape)
+		{
+			// ANMA_* are Animal Magnetism's rewards: the attractor and the accumulator.
+			case ItemID.ANMA_30_REWARD:
+				return LOSS_WITH_ATTRACTOR;
+			case ItemID.ANMA_50_REWARD:
+				return LOSS_WITH_ACCUMULATOR;
+			case ItemID.AVAS_ASSEMBLER:
+			case ItemID.AVAS_ASSEMBLER_TROUVER:
+			case ItemID.AVAS_ASSEMBLER_MASORI:
+			case ItemID.AVAS_ASSEMBLER_MASORI_TROUVER:
+			case ItemID.SKILLCAPE_MAX_ASSEMBLER:
+			case ItemID.SKILLCAPE_MAX_ASSEMBLER_TROUVER:
+			case ItemID.SKILLCAPE_MAX_ASSEMBLER_MASORI:
+			case ItemID.SKILLCAPE_MAX_ASSEMBLER_MASORI_TROUVER:
+				return LOSS_WITH_ASSEMBLER;
+			default:
+				break;
+		}
+
+		// A quiver saves nothing on its own — the effect is added by taking it to Ava with a
+		// device, which sets an account-wide varbit rather than changing the quiver's item id.
+		// Every quiver the player owns gains it at once, so the worn id can't answer this.
+		if (isDizanasQuiver(cape))
+		{
+			// The varbit names the device, in the order Ava hands them out. Observed as 3 on an
+			// assembler-upgraded quiver; 1 and 2 follow from there. Anything else unrecognised is
+			// read as the assembler, being both the best and the common case.
+			switch (client.getVarbitValue(VarbitID.DIZANAS_QUIVER_AMMO_SAVE))
+			{
+				case 0:
+					return LOSS_WITH_NO_DEVICE;
+				case 1:
+					return LOSS_WITH_ATTRACTOR;
+				case 2:
+					return LOSS_WITH_ACCUMULATOR;
+				default:
+					return LOSS_WITH_ASSEMBLER;
+			}
+		}
+
+		return LOSS_WITH_NO_DEVICE;
+	}
+
+	private int equippedCapeId()
+	{
+		final net.runelite.api.ItemContainer worn = client.getItemContainer(InventoryID.WORN);
+		if (worn == null)
+		{
+			return -1;
+		}
+		final net.runelite.api.Item[] items = worn.getItems();
+		final int slot = EquipmentInventorySlot.CAPE.getSlotIdx();
+		return slot < items.length ? items[slot].getId() : -1;
+	}
+
+	/**
+	 * Whether a cape-slot item is a quiver. Broken and mangled variants are left out — they
+	 * can't be worn, so they can't be here.
+	 */
+	private static boolean isDizanasQuiver(int itemId)
+	{
+		return itemId == ItemID.DIZANAS_QUIVER_UNCHARGED
+			|| itemId == ItemID.DIZANAS_QUIVER_UNCHARGED_TROUVER
+			|| itemId == ItemID.DIZANAS_QUIVER_CHARGED
+			|| itemId == ItemID.DIZANAS_QUIVER_CHARGED_TROUVER
+			|| itemId == ItemID.DIZANAS_QUIVER_INFINITE
+			|| itemId == ItemID.DIZANAS_QUIVER_INFINITE_TROUVER;
+	}
+
+	static int dartId(String name)
+	{
+		switch (name.trim().toLowerCase())
+		{
+			case "bronze dart": return ItemID.BRONZE_DART;
+			case "iron dart": return ItemID.IRON_DART;
+			case "steel dart": return ItemID.STEEL_DART;
+			case "black dart": return ItemID.BLACK_DART;
+			case "mithril dart": return ItemID.MITHRIL_DART;
+			case "adamant dart": return ItemID.ADAMANT_DART;
+			case "rune dart": return ItemID.RUNE_DART;
+			case "amethyst dart": return ItemID.AMETHYST_DART;
+			case "dragon dart": return ItemID.DRAGON_DART;
+			default: return -1;
+		}
+	}
+
+	private int equippedWeaponId()
+	{
+		final net.runelite.api.ItemContainer worn = client.getItemContainer(InventoryID.WORN);
+		if (worn == null)
+		{
+			return -1;
+		}
+		final net.runelite.api.Item[] items = worn.getItems();
+		final int slot = EquipmentInventorySlot.WEAPON.getSlotIdx();
+		return slot < items.length ? items[slot].getId() : -1;
+	}
+
+	private static boolean isScythe(int itemId)
+	{
+		return itemId == ItemID.SCYTHE_OF_VITUR
+			|| itemId == ItemID.SCYTHE_OF_VITUR_OR
+			|| itemId == ItemID.SCYTHE_OF_VITUR_BL;
+	}
+
+	private static boolean isBlowpipe(int itemId)
+	{
+		return itemId == ItemID.TOXIC_BLOWPIPE_LOADED
+			|| itemId == ItemID.TOXIC_BLOWPIPE_LOADED_ORNAMENT;
+	}
+
+	private static boolean isTentacle(int itemId)
+	{
+		return itemId == ItemID.ABYSSAL_TENTACLE || itemId == ItemID.LEAGUE_3_WHIP_TENTACLE;
+	}
+
+	/** Only the charged forms; an uncharged venator bow can't be fired. */
+	private static boolean isVenatorBow(int itemId)
+	{
+		return itemId == ItemID.VENATOR_BOW || itemId == ItemID.VENATOR_BOW_ORNAMENT;
+	}
+
+	/**
+	 * Diffs what the player is carrying, every tick.
+	 *
+	 * <p>Deliberately unconditional. This used to run only on ticks flagged by an item container
+	 * change or by one of a hardcoded list of charge varbits, and that scheduling was the source
+	 * of every "supply X isn't tracked" report: the rune pouch wasn't on the list at all, and a
+	 * charge held in a varbit is only reliably observable by reading its value, not by waiting
+	 * for an event naming it. A resource that nothing flagged was billed late, in a lump, on the
+	 * next unrelated inventory change — or erased, if that change happened to be a bank visit.
+	 *
+	 * <p>The saving was never worth it. The diff is a ~60 entry map against the previous one, and
+	 * item names are only resolved for entries that actually changed, so an idle tick does almost
+	 * nothing.
+	 */
+	private void processSupplies()
+	{
+		if (supplyResyncPending)
+		{
+			supplyResyncPending = false;
+			supplyTracker.resync();
+			return;
+		}
 
 		if (!config.trackSupplies())
 		{
@@ -814,22 +1699,136 @@ public class SlayerTaskLootPlugin extends Plugin
 			return;
 		}
 
-		final SupplyCharge spent = supplyTracker.charge();
-		if (spent.isEmpty() || activeTask == null || activeTask.isCompleted())
+		recordSupplyCharge(supplyTracker.charge());
+	}
+
+	private void recordSupplyCharge(SupplyCharge charge)
+	{
+		if (charge.isEmpty() || activeTask == null)
 		{
 			return;
 		}
-
 		if (sessionOpen)
 		{
-			activeTask.addSupplyCharge(spent);
+			activeTask.addSupplyCharge(activeSessionId, charge);
 			markDirty();
+			return;
 		}
-		else if (config.graceWindow() > 0)
+		if (activeTask.isCompleted())
+		{
+			// The kill that finishes an assignment closes its session during packet processing,
+			// before the tick loop reads what that kill cost. Dropping the charge there would
+			// omit the supplies spent on every final kill. Credited to the session the kill
+			// belongs to, and bounded to the same tick tolerance used to line up its drop, so
+			// restocking after the task ends still isn't billed to it.
+			if (lastCreditSessionId != null && taskEndTick >= 0
+				&& client.getTickCount() - taskEndTick <= CREDIT_MATCH_TOLERANCE)
+			{
+				activeTask.addSupplyCharge(lastCreditSessionId, charge);
+				markDirty();
+			}
+			return;
+		}
+		if (config.graceWindow() > 0)
 		{
 			// Might belong to a session that hasn't opened yet — hold it and decide later.
-			graceBuffer.add(new BufferedCharge(client.getTickCount(), spent));
+			graceBuffer.add(new BufferedCharge(client.getTickCount(), charge));
 		}
+	}
+
+	private void processCollectedLoot()
+	{
+		if (config.lootMode() != LootMode.COLLECTED)
+		{
+			pendingCollectedDrops.clear();
+			pendingInventoryGains.clear();
+			collectionInventoryDirty = false;
+			return;
+		}
+
+		final int now = client.getTickCount();
+		if (collectionInventoryDirty)
+		{
+			collectionInventoryDirty = false;
+			final Map<Integer, Integer> current = takeInventorySnapshot();
+			if (collectionInventorySnapshot != null && !isResyncInterfaceOpen())
+			{
+				for (Map.Entry<Integer, Integer> entry : current.entrySet())
+				{
+					final int gained = entry.getValue()
+						- collectionInventorySnapshot.getOrDefault(entry.getKey(), 0);
+					if (gained > 0)
+					{
+						pendingInventoryGains.add(new InventoryGain(now, entry.getKey(), gained));
+					}
+				}
+			}
+			else
+			{
+				pendingInventoryGains.clear();
+			}
+			collectionInventorySnapshot = current;
+		}
+
+		for (Iterator<InventoryGain> gains = pendingInventoryGains.iterator(); gains.hasNext(); )
+		{
+			final InventoryGain gain = gains.next();
+			for (Iterator<PendingCollectedDrop> drops = pendingCollectedDrops.iterator();
+				drops.hasNext() && gain.quantity > 0; )
+			{
+				final PendingCollectedDrop drop = drops.next();
+				if (drop.itemId != gain.itemId)
+				{
+					continue;
+				}
+
+				final int matched = Math.min(gain.quantity, drop.quantity);
+				if (activeTask != null)
+				{
+					activeTask.addItem(drop.sessionId, drop.itemId, matched,
+						(long) drop.unitPrice * matched);
+					markDirty();
+				}
+				gain.quantity -= matched;
+				drop.quantity -= matched;
+				if (drop.quantity == 0)
+				{
+					drops.remove();
+				}
+			}
+			if (gain.quantity == 0 || gain.tick < now - toTicks(config.lootCreditWindow()))
+			{
+				gains.remove();
+			}
+		}
+
+		pendingCollectedDrops.removeIf(
+			drop -> drop.tick < now - toTicks(config.lootCreditWindow()));
+	}
+
+	private Map<Integer, Integer> takeInventorySnapshot()
+	{
+		final Map<Integer, Integer> snapshot = new HashMap<>();
+		final net.runelite.api.ItemContainer inventory = client.getItemContainer(InventoryID.INV);
+		if (inventory != null)
+		{
+			for (net.runelite.api.Item item : inventory.getItems())
+			{
+				if (item.getId() > 0 && item.getQuantity() > 0)
+				{
+					snapshot.merge(itemManager.canonicalize(item.getId()),
+						item.getQuantity(), Integer::sum);
+				}
+			}
+		}
+		return snapshot;
+	}
+
+	private void resyncCollectionInventory()
+	{
+		collectionInventorySnapshot = takeInventorySnapshot();
+		collectionInventoryDirty = false;
+		pendingInventoryGains.clear();
 	}
 
 	@SuppressWarnings("unused")
@@ -889,21 +1888,30 @@ public class SlayerTaskLootPlugin extends Plugin
 	public void onGameTick(GameTick event)
 	{
 		final int now = client.getTickCount();
+		processRepeatingWeaponUsage(now);
+		processSpecialAttackCharges(now);
+		processQuiverSplinters(now);
 
 		// Kill credit for this tick is already registered by onVarbitChanged, which fires
 		// during packet processing, so the session state below is up to date.
 		reconcileTargets(now);
 		resolvePendingLoot();
+		processCollectedLoot();
 		processSupplies();
 
 		if (sessionOpen && activeTask != null)
 		{
-			activeTask.tickOnTask();
+			activeTask.tickSession(activeSessionId);
+			// The panel shows elapsed time off this counter, so an open session is always
+			// behind the live state even when nothing else happened. Without this the clock
+			// only moved when a kill or a drop happened to mark the panel dirty, and read as
+			// frozen between them. The existing throttle keeps this to one rebuild per 3s.
+			panelDirty = true;
 
 			if (lastCreditTick >= 0 && now - lastCreditTick > toTicks(config.sessionTimeout() * 60))
 			{
 				log.debug("Session idle for {} minutes, closing", config.sessionTimeout());
-				closeSession();
+				closeSession("IDLE_TIMEOUT");
 				markDirty();
 			}
 		}
@@ -982,23 +1990,29 @@ public class SlayerTaskLootPlugin extends Plugin
 
 			// Carried items aren't readable until now, and anything that changed while
 			// logged out must not be charged.
+			applyChargeConfig();
 			supplyTracker.resync();
+			resyncCollectionInventory();
 			updateTask();
 		}
 		else if (state == GameState.LOGIN_SCREEN || state == GameState.HOPPING)
 		{
+			closeSession(state == GameState.HOPPING ? "WORLD_HOP" : "LOGOUT");
 			persist();
 			// Tick counts don't carry across a session, so anchors measured in ticks are
 			// meaningless now. A new kill re-establishes them.
 			lastCreditTick = -1;
+			lastCreditSessionId = null;
 			taskEndTick = -1;
 			// The counter is re-read on login; treat the next read as a fresh baseline so
 			// logging in never looks like a burst of credited kills.
 			lastSlayerCount = -1;
-			closeSession();
+			quiverShotTick = -1;
+			specialEnergyLastSeen = -1;
 			supplyTracker.clear();
 			pendingLoot.clear();
 			recentDeaths.clear();
+			creditedNpcDeathTicks.clear();
 			openInterfaces.clear();
 		}
 	}
@@ -1016,8 +2030,10 @@ public class SlayerTaskLootPlugin extends Plugin
 		// names and prices through ItemManager, so hop across before touching game state.
 		final boolean trim = "historySize".equals(event.getKey());
 		final boolean suppliesToggled = "trackSupplies".equals(event.getKey());
+		final boolean lootModeChanged = "lootMode".equals(event.getKey());
 		clientThread.invokeLater(() ->
 		{
+			applyChargeConfig();
 			if (trim)
 			{
 				trimHistory();
@@ -1028,7 +2044,12 @@ public class SlayerTaskLootPlugin extends Plugin
 				// Rebaseline on the way back in. Without this, everything used while tracking
 				// was off would land on the task the moment it's switched on.
 				supplyTracker.resync();
-				supplyDirty = false;
+				resyncCollectionInventory();
+			}
+			if (lootModeChanged)
+			{
+				pendingCollectedDrops.clear();
+				resyncCollectionInventory();
 			}
 			pushToPanel();
 		});
@@ -1062,6 +2083,11 @@ public class SlayerTaskLootPlugin extends Plugin
 			activeTask = activeJson == null || activeJson.isEmpty()
 				? null
 				: gson.fromJson(activeJson, TaskLootRecord.class);
+			if (activeTask != null)
+			{
+				activeTask.getAssignmentId();
+				activeTask.closeOpenSessions(System.currentTimeMillis(), "CLIENT_RESTART");
+			}
 		}
 		catch (JsonSyntaxException ex)
 		{
@@ -1099,17 +2125,179 @@ public class SlayerTaskLootPlugin extends Plugin
 			{
 				return;
 			}
+			final TaskLootRecord previous = activeTask;
+			closeSession("RESET");
 			activeTask = new TaskLootRecord(
-				activeTask.getTaskName(),
-				activeTask.getTaskLocation(),
-				activeTask.getInitialAmount(),
+				previous.getTaskName(),
+				previous.getTaskLocation(),
+				previous.getInitialAmount(),
 				System.currentTimeMillis());
-			closeSession();
 			lastCreditTick = -1;
 			supplyTracker.resync();
 			persist();
 			pushToPanel();
 		});
+	}
+
+	void startNewSession()
+	{
+		clientThread.invokeLater(() ->
+		{
+			if (activeTask == null || activeTask.isCompleted() || sessionOpen)
+			{
+				return;
+			}
+
+			sessionOpen = true;
+			activeSessionId = activeTask.openNewSession(System.currentTimeMillis(), true).getSessionId();
+			lastCreditSessionId = activeSessionId;
+			lastCreditTick = client.getTickCount();
+			graceBuffer.clear();
+			supplyTracker.resync();
+			markDirty();
+			pushToPanel();
+		});
+	}
+
+	void endCurrentSession()
+	{
+		clientThread.invokeLater(() ->
+		{
+			if (!sessionOpen)
+			{
+				return;
+			}
+			closeSession("MANUAL");
+			markDirty();
+			pushToPanel();
+		});
+	}
+
+	void resumeLastSession()
+	{
+		if (activeTask != null && activeTask.latestClosedSession() != null)
+		{
+			resumeSession(activeTask.latestClosedSession().getSessionId());
+		}
+	}
+
+	void resumeSession(String sessionId)
+	{
+		clientThread.invokeLater(() ->
+		{
+			if (activeTask == null || activeTask.isCompleted() || sessionOpen)
+			{
+				return;
+			}
+
+			final TaskSession previous = activeTask.resumeSession(sessionId, System.currentTimeMillis());
+			if (previous == null)
+			{
+				return;
+			}
+
+			activeSessionId = previous.getSessionId();
+			lastCreditSessionId = activeSessionId;
+			sessionOpen = true;
+			lastCreditTick = client.getTickCount();
+			graceBuffer.clear();
+			supplyTracker.resync();
+			markDirty();
+			pushToPanel();
+		});
+	}
+
+	void mergeSessions(String sourceId, String targetId)
+	{
+		clientThread.invokeLater(() ->
+		{
+			if (activeTask == null || sessionOpen || sourceId == null || targetId == null
+				|| sourceId.equals(targetId))
+			{
+				return;
+			}
+
+			if (activeTask.mergeSessions(targetId, sourceId))
+			{
+				markDirty();
+				persist();
+				pushToPanel();
+			}
+		});
+	}
+
+	void poolHistoryIntoCurrent(String sourceAssignmentId)
+	{
+		clientThread.invokeLater(() ->
+		{
+			final TaskLootRecord source = findHistoryTask(sourceAssignmentId);
+			if (activeTask == null || activeTask.isCompleted() || source == null
+				|| !sameTask(activeTask, source))
+			{
+				return;
+			}
+
+			activeTask.mergeRecord(source);
+			history.remove(source);
+			historyViewsDirty = true;
+			markDirty();
+			persist();
+			pushToPanel();
+		});
+	}
+
+	void mergeHistoryTasks(String targetAssignmentId, String sourceAssignmentId)
+	{
+		clientThread.invokeLater(() ->
+		{
+			final TaskLootRecord target = findHistoryTask(targetAssignmentId);
+			final TaskLootRecord source = findHistoryTask(sourceAssignmentId);
+			if (target == null || source == null || target == source || !sameTask(target, source))
+			{
+				return;
+			}
+
+			target.mergeRecord(source);
+			history.remove(source);
+			historyViewsDirty = true;
+			markDirty();
+			persist();
+			pushToPanel();
+		});
+	}
+
+	void deleteHistoryTask(String assignmentId)
+	{
+		clientThread.invokeLater(() ->
+		{
+			final TaskLootRecord task = findHistoryTask(assignmentId);
+			if (task != null)
+			{
+				history.remove(task);
+				historyViewsDirty = true;
+				persist();
+				pushToPanel();
+			}
+		});
+	}
+
+	@Nullable
+	private TaskLootRecord findHistoryTask(String assignmentId)
+	{
+		for (TaskLootRecord task : history)
+		{
+			if (task.getAssignmentId().equals(assignmentId))
+			{
+				return task;
+			}
+		}
+		return null;
+	}
+
+	private static boolean sameTask(TaskLootRecord left, TaskLootRecord right)
+	{
+		return Objects.equals(left.getTaskName(), right.getTaskName())
+			&& Objects.equals(left.getTaskLocation(), right.getTaskLocation());
 	}
 
 	void clearHistory()
@@ -1174,12 +2362,37 @@ public class SlayerTaskLootPlugin extends Plugin
 	{
 		final List<TaskView.LootRow> rows = new ArrayList<>();
 		long lootValue = 0;
+		long supplyValue = record.getSupplyCost();
+		Map<Integer, Integer> displayedItems = record.getItems();
+		Map<Integer, Long> displayedItemValues = new LinkedHashMap<>();
+		final Map<Integer, Long> recordedItemValues = record.getItemValues();
+		for (Map.Entry<Integer, Integer> entry : displayedItems.entrySet())
+		{
+			displayedItemValues.put(entry.getKey(), recordedItemValues.getOrDefault(
+				entry.getKey(), (long) itemManager.getItemPrice(entry.getKey()) * entry.getValue()));
+		}
+		Map<Integer, SupplyEntry> displayedSupplies = record.getSupplies();
 
-		for (Map.Entry<Integer, Integer> entry : record.getItems().entrySet())
+		if (config.trackSupplies() && config.netMatchingDrops())
+		{
+			final long grossBreakdown = displayedSupplies.values().stream()
+				.mapToLong(SupplyEntry::getValue).sum();
+			final TaskNetting.Result net = TaskNetting.apply(
+				displayedItems, displayedItemValues, displayedSupplies);
+			displayedItems = net.getLootQuantities();
+			displayedItemValues = net.getLootValues();
+			displayedSupplies = net.getSupplies();
+			final long netBreakdown = displayedSupplies.values().stream()
+				.mapToLong(SupplyEntry::getValue).sum();
+			// Preserve any legacy/unitemized supply value outside the visible breakdown.
+			supplyValue -= grossBreakdown - netBreakdown;
+		}
+
+		for (Map.Entry<Integer, Integer> entry : displayedItems.entrySet())
 		{
 			final int itemId = entry.getKey();
 			final int quantity = entry.getValue();
-			final long value = (long) itemManager.getItemPrice(itemId) * quantity;
+			final long value = displayedItemValues.getOrDefault(itemId, 0L);
 			lootValue += value;
 
 			rows.add(new TaskView.LootRow(itemId, itemName(itemId), quantity, value, ""));
@@ -1188,7 +2401,7 @@ public class SlayerTaskLootPlugin extends Plugin
 		rows.sort(Comparator.comparingLong(TaskView.LootRow::getValue).reversed());
 
 		final List<TaskView.LootRow> supplyRows = new ArrayList<>();
-		for (Map.Entry<Integer, SupplyEntry> entry : record.getSupplies().entrySet())
+		for (Map.Entry<Integer, SupplyEntry> entry : displayedSupplies.entrySet())
 		{
 			final int itemId = entry.getKey();
 			final SupplyEntry supply = entry.getValue();
@@ -1205,14 +2418,28 @@ public class SlayerTaskLootPlugin extends Plugin
 				}
 			}
 
+			final List<String> breakdown = new ArrayList<>();
+			supply.getComponents().forEach((componentId, quantity) -> breakdown.add(
+				itemName(componentId) + " x" + QuantityFormatter.quantityToStackSize(quantity)));
+
 			supplyRows.add(new TaskView.LootRow(
 				itemId, name, supply.getQuantity(), supply.getValue(),
-				supply.isDoseBased() ? "doses" : ""));
+				supply.isDoseBased() ? "doses" : "",
+				Collections.unmodifiableList(breakdown)));
 		}
 
 		supplyRows.sort(Comparator.comparingLong(TaskView.LootRow::getValue).reversed());
 
+		final List<TaskView.SessionView> sessionViews = new ArrayList<>();
+		int sessionNumber = 1;
+		for (TaskSession session : record.getTaskSessions())
+		{
+			sessionViews.add(new TaskView.SessionView(
+				session.getSessionId(), sessionNumber++, session.getOnTaskTicks(), session.isOpen()));
+		}
+
 		return new TaskView(
+			record.getAssignmentId(),
 			record.getTaskName(),
 			record.getTaskLocation(),
 			record.getKills(),
@@ -1221,11 +2448,14 @@ public class SlayerTaskLootPlugin extends Plugin
 			record.getEndedAt(),
 			record.isCompleted(),
 			lootValue,
-			record.getSupplyCost(),
+			supplyValue,
 			record.getSessions(),
 			record.getOnTaskTicks(),
+			record == activeTask && sessionOpen,
+			record == activeTask && !sessionOpen && record.latestClosedSession() != null,
 			Collections.unmodifiableList(rows),
-			Collections.unmodifiableList(supplyRows));
+			Collections.unmodifiableList(supplyRows),
+			Collections.unmodifiableList(sessionViews));
 	}
 
 	private String itemName(int itemId)
@@ -1245,25 +2475,9 @@ public class SlayerTaskLootPlugin extends Plugin
 		return "Item #" + itemId;
 	}
 
-	private static BufferedImage buildNavIcon()
+	private BufferedImage buildNavIcon()
 	{
-		final int size = 17;
-		final BufferedImage img = new BufferedImage(size, size, BufferedImage.TYPE_INT_ARGB);
-		final Graphics2D g = img.createGraphics();
-		g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-
-		g.setColor(new Color(120, 30, 30));
-		g.fillOval(1, 1, size - 2, size - 2);
-
-		g.setColor(new Color(70, 15, 15));
-		g.drawOval(1, 1, size - 2, size - 2);
-
-		g.setColor(Color.WHITE);
-		g.setFont(new Font("SansSerif", Font.BOLD, 10));
-		g.drawString("S", 6, 12);
-
-		g.dispose();
-		return img;
+		return skillIconManager.getSkillImage(Skill.SLAYER, true);
 	}
 
 	// ------------------------------------------------------------------
@@ -1274,15 +2488,35 @@ public class SlayerTaskLootPlugin extends Plugin
 	private static final class PendingLoot
 	{
 		private final int tick;
+		private final int npcIndex;
 		private final String npcName;
 		private final Collection<ItemStack> items;
+		private final LootSource source;
+		private final String sessionId;
 
-		private PendingLoot(int tick, String npcName, Collection<ItemStack> items)
+		private PendingLoot(int tick, int npcIndex, String npcName, Collection<ItemStack> items,
+			LootSource source, String sessionId)
 		{
 			this.tick = tick;
+			this.npcIndex = npcIndex;
 			this.npcName = npcName;
-			this.items = items;
+			this.items = copyLoot(items);
+			this.source = source;
+			this.sessionId = sessionId;
 		}
+
+	}
+
+	/** Snapshot event-owned loot before RuneLite reuses or clears its backing collection. */
+	static List<ItemStack> copyLoot(Collection<ItemStack> items)
+	{
+		return new ArrayList<>(items);
+	}
+
+	private enum LootSource
+	{
+		SERVER,
+		GROUND
 	}
 
 	/** Supply spend from before a session opened, replayable within the grace window. */
@@ -1295,6 +2529,58 @@ public class SlayerTaskLootPlugin extends Plugin
 		{
 			this.tick = tick;
 			this.charge = charge;
+		}
+	}
+
+	private static final class RecentDeath
+	{
+		private final int npcIndex;
+		private final String npcName;
+		private final int tick;
+		private final boolean playerRelated;
+		private boolean credited;
+		private boolean lootClaimed;
+		private String sessionId;
+
+		private RecentDeath(int npcIndex, String npcName, int tick, boolean playerRelated)
+		{
+			this.npcIndex = npcIndex;
+			this.npcName = npcName;
+			this.tick = tick;
+			this.playerRelated = playerRelated;
+		}
+	}
+
+	private static final class PendingCollectedDrop
+	{
+		private final int tick;
+		private final String sessionId;
+		private final int itemId;
+		private int quantity;
+		private final int unitPrice;
+
+		private PendingCollectedDrop(int tick, String sessionId, int itemId, int quantity,
+			int unitPrice)
+		{
+			this.tick = tick;
+			this.sessionId = sessionId;
+			this.itemId = itemId;
+			this.quantity = quantity;
+			this.unitPrice = unitPrice;
+		}
+	}
+
+	private static final class InventoryGain
+	{
+		private final int tick;
+		private final int itemId;
+		private int quantity;
+
+		private InventoryGain(int tick, int itemId, int quantity)
+		{
+			this.tick = tick;
+			this.itemId = itemId;
+			this.quantity = quantity;
 		}
 	}
 }
