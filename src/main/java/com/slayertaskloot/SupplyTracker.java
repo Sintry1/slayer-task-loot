@@ -297,6 +297,13 @@ class SupplyTracker
 			{
 				continue;
 			}
+			if (delta < 0 && isPrayerRemains(id))
+			{
+				// Burying bones and scattering ashes grants Prayer experience, but these
+				// drops are loot rather than task supplies. Never let their removal create
+				// a supply row which the default netting view would cancel against loot.
+				continue;
+			}
 
 			final String name = itemName(id);
 			final int doses = doseCount(name);
@@ -520,6 +527,54 @@ class SupplyTracker
 			// Fall back to the observed variant-value delta if composition data is unavailable.
 		}
 		return false;
+	}
+
+	boolean isPrayerRemains(int itemId)
+	{
+		try
+		{
+			final ItemComposition comp = itemManager.getItemComposition(itemId);
+			return comp != null && (hasPrayerRemainsAction(comp.getInventoryActions())
+				|| isPrayerRemainsName(comp.getName()));
+		}
+		catch (Exception ex)
+		{
+			return false;
+		}
+	}
+
+	/** Testable classification shared by every kind of bone and demonic ash. */
+	static boolean hasPrayerRemainsAction(String[] actions)
+	{
+		if (actions == null)
+		{
+			return false;
+		}
+		for (String action : actions)
+		{
+			if ("Bury".equalsIgnoreCase(action) || "Scatter".equalsIgnoreCase(action))
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	static boolean isPrayerRemainsName(String name)
+	{
+		if (name == null)
+		{
+			return false;
+		}
+		final String lower = name.toLowerCase(java.util.Locale.ROOT);
+		return lower.endsWith(" ashes") || lower.endsWith(" bones");
+	}
+
+	Map<Integer, Integer> takeRunePouchSnapshot()
+	{
+		final Map<Integer, Integer> snapshot = new HashMap<>();
+		addRunePouch(snapshot);
+		return snapshot;
 	}
 
 	/**

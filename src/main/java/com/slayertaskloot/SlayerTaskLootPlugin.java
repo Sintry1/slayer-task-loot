@@ -32,8 +32,12 @@ import net.runelite.api.ChatMessageType;
 import net.runelite.api.EquipmentInventorySlot;
 import net.runelite.api.GameState;
 import net.runelite.api.ItemComposition;
+import net.runelite.api.MenuAction;
 import net.runelite.api.NPC;
 import net.runelite.api.NPCComposition;
+import net.runelite.api.Tile;
+import net.runelite.api.TileItem;
+import net.runelite.api.WorldView;
 import net.runelite.api.events.ActorDeath;
 import net.runelite.api.events.AnimationChanged;
 import net.runelite.api.events.ChatMessage;
@@ -41,6 +45,7 @@ import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.GameTick;
 import net.runelite.api.events.GraphicChanged;
 import net.runelite.api.events.ItemContainerChanged;
+import net.runelite.api.events.ItemDespawned;
 import net.runelite.api.events.MenuOptionClicked;
 import net.runelite.api.events.NpcDespawned;
 import net.runelite.api.events.VarbitChanged;
@@ -116,6 +121,8 @@ public class SlayerTaskLootPlugin extends Plugin
 	 * be a coin flip.
 	 */
 	private static final int CREDIT_MATCH_TOLERANCE = 2;
+	/** A ground-item click may take several ticks to reach while the player walks to it. */
+	private static final int PICKUP_ACTION_EXPIRY_TICKS = 20;
 
 	/** Persist at most this often, in game ticks, so a long task isn't a write per kill. */
 	private static final int PERSIST_INTERVAL_TICKS = 10;
@@ -298,6 +305,8 @@ public class SlayerTaskLootPlugin extends Plugin
 	private final Deque<PendingLoot> pendingLoot = new ArrayDeque<>();
 	private final Deque<PendingCollectedDrop> pendingCollectedDrops = new ArrayDeque<>();
 	private final Deque<InventoryGain> pendingInventoryGains = new ArrayDeque<>();
+	private final Deque<PendingPickup> pendingPickups = new ArrayDeque<>();
+	private final Map<Integer, Integer> pickupInventoryIgnores = new HashMap<>();
 	private Map<Integer, Integer> collectionInventorySnapshot;
 	private boolean collectionInventoryDirty;
 
@@ -401,6 +410,8 @@ public class SlayerTaskLootPlugin extends Plugin
 		pendingLoot.clear();
 		pendingCollectedDrops.clear();
 		pendingInventoryGains.clear();
+		pendingPickups.clear();
+		pickupInventoryIgnores.clear();
 		collectionInventorySnapshot = null;
 		collectionInventoryDirty = false;
 		graceBuffer.clear();
@@ -661,6 +672,8 @@ public class SlayerTaskLootPlugin extends Plugin
 		pendingLoot.clear();
 		pendingCollectedDrops.clear();
 		pendingInventoryGains.clear();
+		pendingPickups.clear();
+		pickupInventoryIgnores.clear();
 		resyncCollectionInventory();
 		lastCreditTick = -1;
 		taskEndTick = -1;
@@ -1120,9 +1133,75 @@ public class SlayerTaskLootPlugin extends Plugin
 
 	@SuppressWarnings("unused")
 	@Subscribe
+	public void onItemDespawned(ItemDespawned event)
+	{
+		if (activeTask == null || config.lootMode() != LootMode.COLLECTED
+			|| event.getTile() == null || event.getItem() == null)
+		{
+			return;
+		}
+
+		final int now = client.getTickCount();
+		final int rawItemId = event.getItem().getId();
+		final int itemId = itemManager.canonicalize(rawItemId);
+		final int sceneX = event.getTile().getSceneLocation().getX();
+		final int sceneY = event.getTile().getSceneLocation().getY();
+		for (Iterator<PendingPickup> it = pendingPickups.iterator(); it.hasNext(); )
+		{
+			final PendingPickup pickup = it.next();
+			if (pickup.tick < now - PICKUP_ACTION_EXPIRY_TICKS)
+			{
+				it.remove();
+				continue;
+			}
+			if (pickup.rawItemId != rawItemId || pickup.sceneX != sceneX || pickup.sceneY != sceneY)
+			{
+				continue;
+			}
+
+			final int quantity = event.getItem().getQuantity();
+			if (quantity > 0)
+			{
+				// A despawn at the exact tile the player clicked is the collection signal for
+				// sacks, barrels, bonecrushers, and other destinations that bypass INV.
+				pendingInventoryGains.add(new InventoryGain(now, itemId, quantity));
+				pickupInventoryIgnores.merge(itemId, quantity, Integer::sum);
+			}
+			it.remove();
+			break;
+		}
+	}
+
+	@SuppressWarnings("unused")
+	@Subscribe
 	public void onMenuOptionClicked(MenuOptionClicked event)
 	{
-		if ("Drop".equalsIgnoreCase(Text.removeTags(event.getMenuOption())))
+		final String option = Text.removeTags(event.getMenuOption());
+		if ("Take".equalsIgnoreCase(option) && isGroundItemAction(event.getMenuAction())
+			&& activeTask != null && config.lootMode() == LootMode.COLLECTED)
+		{
+			final int worldViewId = event.getMenuEntry().getWorldViewId();
+			final WorldView worldView = client.getWorldView(worldViewId);
+			final int plane = worldView == null ? -1 : worldView.getPlane();
+			final int quantity = groundItemQuantity(
+				worldView, plane, event.getParam0(), event.getParam1(), event.getId());
+			// Some menu entries do not expose a usable world view. Still retain the Take
+			// action so ItemDespawned can confirm it; one is only a scene-check fallback.
+			pendingPickups.add(new PendingPickup(client.getTickCount(), worldViewId, plane,
+				event.getId(), itemManager.canonicalize(event.getId()), Math.max(quantity, 1),
+				event.getParam0(), event.getParam1()));
+		}
+
+		if (isRemoteStorageAction(option) && !isResyncInterfaceOpen())
+		{
+			// Soul bearers and similar remote-deposit items transfer inventory to storage.
+			// Re-baseline on the resulting tick so the transfer is never billed as usage.
+			supplyResyncPending = true;
+		}
+
+		if ("Drop".equalsIgnoreCase(option)
+			|| "Bury".equalsIgnoreCase(option)
+			|| "Scatter".equalsIgnoreCase(option))
 		{
 			final net.runelite.api.ItemContainer inventory =
 				client.getItemContainer(InventoryID.INV);
@@ -1131,11 +1210,89 @@ public class SlayerTaskLootPlugin extends Plugin
 				: inventory.getItem(event.getParam0());
 			if (item != null && item.getId() > 0 && item.getQuantity() > 0)
 			{
-				// Adjust the old baseline before the asynchronous removal instead of trying
-				// to guess which game tick will observe it.
-				supplyTracker.ignoreRemoval(item.getId(), item.getQuantity());
+				// Drop removes the whole selected stack; bury/scatter consumes one item per
+				// click, but neither is a task supply cost that should net against its loot.
+				final int ignored = "Drop".equalsIgnoreCase(option) ? item.getQuantity() : 1;
+				supplyTracker.ignoreRemoval(item.getId(), ignored);
 			}
 		}
+	}
+
+	private static boolean isGroundItemAction(MenuAction action)
+	{
+		return action == MenuAction.GROUND_ITEM_FIRST_OPTION
+			|| action == MenuAction.GROUND_ITEM_SECOND_OPTION
+			|| action == MenuAction.GROUND_ITEM_THIRD_OPTION
+			|| action == MenuAction.GROUND_ITEM_FOURTH_OPTION
+			|| action == MenuAction.GROUND_ITEM_FIFTH_OPTION;
+	}
+
+	private static int groundItemQuantity(@Nullable WorldView worldView, int plane,
+		int sceneX, int sceneY, int itemId)
+	{
+		if (worldView == null || plane < 0 || sceneX < 0 || sceneY < 0
+			|| sceneX >= worldView.getSizeX() || sceneY >= worldView.getSizeY())
+		{
+			return -1;
+		}
+		final Tile tile = worldView.getScene().getTiles()[plane][sceneX][sceneY];
+		if (tile == null)
+		{
+			return -1;
+		}
+
+		int quantity = 0;
+		for (TileItem item : tile.getGroundItems())
+		{
+			if (item.getId() == itemId)
+			{
+				quantity += item.getQuantity();
+			}
+		}
+		return quantity;
+	}
+
+	private void resolvePendingPickupFallbacks(int now)
+	{
+		for (Iterator<PendingPickup> it = pendingPickups.iterator(); it.hasNext(); )
+		{
+			final PendingPickup pickup = it.next();
+			if (pickup.tick < now - PICKUP_ACTION_EXPIRY_TICKS)
+			{
+				it.remove();
+				continue;
+			}
+			// Give the normal ItemDespawned callback the current tick first. The scene check
+			// is a fallback for automatic-container updates that don't produce that sequence.
+			if (pickup.tick >= now)
+			{
+				continue;
+			}
+
+			final int current = groundItemQuantity(client.getWorldView(pickup.worldViewId),
+				pickup.plane, pickup.sceneX, pickup.sceneY, pickup.rawItemId);
+			final int removed = removedGroundQuantity(pickup.initialQuantity, current);
+			if (removed > 0)
+			{
+				pendingInventoryGains.add(new InventoryGain(now, pickup.itemId, removed));
+				pickupInventoryIgnores.merge(pickup.itemId, removed, Integer::sum);
+				it.remove();
+			}
+		}
+	}
+
+	static int removedGroundQuantity(int initial, int current)
+	{
+		return initial > 0 && current >= 0 ? Math.max(0, initial - current) : 0;
+	}
+
+	/** Soul bearer uses Fill/Bank-All; other portable storage items commonly use Deposit. */
+	static boolean isRemoteStorageAction(String option)
+	{
+		return "Fill".equalsIgnoreCase(option)
+			|| "Deposit".equalsIgnoreCase(option)
+			|| "Bank".equalsIgnoreCase(option)
+			|| "Bank-All".equalsIgnoreCase(option);
 	}
 
 	@SuppressWarnings("unused")
@@ -1742,34 +1899,45 @@ public class SlayerTaskLootPlugin extends Plugin
 		{
 			pendingCollectedDrops.clear();
 			pendingInventoryGains.clear();
+			pendingPickups.clear();
+			pickupInventoryIgnores.clear();
 			collectionInventoryDirty = false;
 			return;
 		}
 
 		final int now = client.getTickCount();
-		if (collectionInventoryDirty)
+		// Rune-pouch quantities are varbits and produce no INV container event. Diff the
+		// combined carried snapshot every tick so automatic pouch pickup is observable.
+		collectionInventoryDirty = false;
+		final Map<Integer, Integer> current = takeInventorySnapshot();
+		if (collectionInventorySnapshot != null && !isResyncInterfaceOpen())
 		{
-			collectionInventoryDirty = false;
-			final Map<Integer, Integer> current = takeInventorySnapshot();
-			if (collectionInventorySnapshot != null && !isResyncInterfaceOpen())
+			for (Map.Entry<Integer, Integer> entry : current.entrySet())
 			{
-				for (Map.Entry<Integer, Integer> entry : current.entrySet())
+				int gained = entry.getValue()
+					- collectionInventorySnapshot.getOrDefault(entry.getKey(), 0);
+				gained = applyPickupInventoryIgnore(
+					pickupInventoryIgnores, entry.getKey(), gained);
+				if (gained > 0)
 				{
-					final int gained = entry.getValue()
-						- collectionInventorySnapshot.getOrDefault(entry.getKey(), 0);
-					if (gained > 0)
-					{
-						pendingInventoryGains.add(new InventoryGain(now, entry.getKey(), gained));
-					}
+					confirmPickupReachedInventory(entry.getKey());
+					pendingInventoryGains.add(new InventoryGain(now, entry.getKey(), gained));
 				}
 			}
-			else
-			{
-				pendingInventoryGains.clear();
-			}
-			collectionInventorySnapshot = current;
 		}
+		else
+		{
+			pendingInventoryGains.clear();
+		}
+		collectionInventorySnapshot = current;
 
+		// Item-container changes and item despawns from the same server update have both
+		// arrived before GameTick. Any unused suppression belongs to a direct-to-container
+		// pickup and must not hide a later, unrelated inventory gain.
+		pickupInventoryIgnores.clear();
+
+		final int collectionRetention = Math.max(
+			CREDIT_MATCH_TOLERANCE, toTicks(config.lootCreditWindow()));
 		for (Iterator<InventoryGain> gains = pendingInventoryGains.iterator(); gains.hasNext(); )
 		{
 			final InventoryGain gain = gains.next();
@@ -1796,14 +1964,51 @@ public class SlayerTaskLootPlugin extends Plugin
 					drops.remove();
 				}
 			}
-			if (gain.quantity == 0 || gain.tick < now - toTicks(config.lootCreditWindow()))
+			if (gain.quantity == 0 || gain.tick < now - collectionRetention)
 			{
 				gains.remove();
 			}
 		}
 
-		pendingCollectedDrops.removeIf(
-			drop -> drop.tick < now - toTicks(config.lootCreditWindow()));
+		pendingCollectedDrops.removeIf(drop -> drop.tick < now - collectionRetention);
+		pendingPickups.removeIf(pickup -> pickup.tick < now - PICKUP_ACTION_EXPIRY_TICKS);
+	}
+
+	/** Prevents one successful ground pickup being counted once by INV and once by its despawn. */
+	static int applyPickupInventoryIgnore(Map<Integer, Integer> ignores, int itemId, int gained)
+	{
+		if (gained <= 0)
+		{
+			return gained;
+		}
+		final int ignored = ignores.getOrDefault(itemId, 0);
+		if (ignored <= 0)
+		{
+			return gained;
+		}
+
+		final int absorbed = Math.min(ignored, gained);
+		if (absorbed == ignored)
+		{
+			ignores.remove(itemId);
+		}
+		else
+		{
+			ignores.put(itemId, ignored - absorbed);
+		}
+		return gained - absorbed;
+	}
+
+	private void confirmPickupReachedInventory(int itemId)
+	{
+		for (Iterator<PendingPickup> it = pendingPickups.iterator(); it.hasNext(); )
+		{
+			if (it.next().itemId == itemId)
+			{
+				it.remove();
+				return;
+			}
+		}
 	}
 
 	private Map<Integer, Integer> takeInventorySnapshot()
@@ -1821,6 +2026,10 @@ public class SlayerTaskLootPlugin extends Plugin
 				}
 			}
 		}
+		// Treat inventory and rune pouch as one carried collection. Moving runes between
+		// them nets to zero, while automatic ground pickup into the pouch is a real gain.
+		supplyTracker.takeRunePouchSnapshot().forEach(
+			(itemId, quantity) -> snapshot.merge(itemId, quantity, Integer::sum));
 		return snapshot;
 	}
 
@@ -1829,6 +2038,7 @@ public class SlayerTaskLootPlugin extends Plugin
 		collectionInventorySnapshot = takeInventorySnapshot();
 		collectionInventoryDirty = false;
 		pendingInventoryGains.clear();
+		pickupInventoryIgnores.clear();
 	}
 
 	@SuppressWarnings("unused")
@@ -1896,6 +2106,7 @@ public class SlayerTaskLootPlugin extends Plugin
 		// during packet processing, so the session state below is up to date.
 		reconcileTargets(now);
 		resolvePendingLoot();
+		resolvePendingPickupFallbacks(now);
 		processCollectedLoot();
 		processSupplies();
 
@@ -2371,7 +2582,19 @@ public class SlayerTaskLootPlugin extends Plugin
 			displayedItemValues.put(entry.getKey(), recordedItemValues.getOrDefault(
 				entry.getKey(), (long) itemManager.getItemPrice(entry.getKey()) * entry.getValue()));
 		}
-		Map<Integer, SupplyEntry> displayedSupplies = record.getSupplies();
+		Map<Integer, SupplyEntry> displayedSupplies = new LinkedHashMap<>(record.getSupplies());
+		for (Iterator<Map.Entry<Integer, SupplyEntry>> it =
+			displayedSupplies.entrySet().iterator(); it.hasNext(); )
+		{
+			final Map.Entry<Integer, SupplyEntry> entry = it.next();
+			if (supplyTracker.isPrayerRemains(entry.getKey()))
+			{
+				// Older snapshots may already contain bones/ashes as supplies. Hide that
+				// invalid charge immediately as well as preventing new ones at collection.
+				supplyValue -= entry.getValue().getValue();
+				it.remove();
+			}
+		}
 
 		if (config.trackSupplies() && config.netMatchingDrops())
 		{
@@ -2581,6 +2804,32 @@ public class SlayerTaskLootPlugin extends Plugin
 			this.tick = tick;
 			this.itemId = itemId;
 			this.quantity = quantity;
+		}
+	}
+
+	/** A local Take action awaiting the matching removal of that ground stack. */
+	private static final class PendingPickup
+	{
+		private final int tick;
+		private final int worldViewId;
+		private final int plane;
+		private final int rawItemId;
+		private final int itemId;
+		private final int initialQuantity;
+		private final int sceneX;
+		private final int sceneY;
+
+		private PendingPickup(int tick, int worldViewId, int plane, int rawItemId, int itemId,
+			int initialQuantity, int sceneX, int sceneY)
+		{
+			this.tick = tick;
+			this.worldViewId = worldViewId;
+			this.plane = plane;
+			this.rawItemId = rawItemId;
+			this.itemId = itemId;
+			this.initialQuantity = initialQuantity;
+			this.sceneX = sceneX;
+			this.sceneY = sceneY;
 		}
 	}
 }
