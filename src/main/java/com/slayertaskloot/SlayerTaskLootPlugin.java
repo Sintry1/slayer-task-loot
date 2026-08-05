@@ -307,6 +307,7 @@ public class SlayerTaskLootPlugin extends Plugin
 	private final Deque<InventoryGain> pendingInventoryGains = new ArrayDeque<>();
 	private final Deque<PendingPickup> pendingPickups = new ArrayDeque<>();
 	private final Map<Integer, Integer> pickupInventoryIgnores = new HashMap<>();
+	private final Map<Integer, Integer> alchemyCollectionIgnores = new HashMap<>();
 	private Map<Integer, Integer> collectionInventorySnapshot;
 	private boolean collectionInventoryDirty;
 
@@ -412,6 +413,7 @@ public class SlayerTaskLootPlugin extends Plugin
 		pendingInventoryGains.clear();
 		pendingPickups.clear();
 		pickupInventoryIgnores.clear();
+		alchemyCollectionIgnores.clear();
 		collectionInventorySnapshot = null;
 		collectionInventoryDirty = false;
 		graceBuffer.clear();
@@ -674,6 +676,7 @@ public class SlayerTaskLootPlugin extends Plugin
 		pendingInventoryGains.clear();
 		pendingPickups.clear();
 		pickupInventoryIgnores.clear();
+		alchemyCollectionIgnores.clear();
 		resyncCollectionInventory();
 		lastCreditTick = -1;
 		taskEndTick = -1;
@@ -1177,6 +1180,7 @@ public class SlayerTaskLootPlugin extends Plugin
 	public void onMenuOptionClicked(MenuOptionClicked event)
 	{
 		final String option = Text.removeTags(event.getMenuOption());
+		final String target = Text.removeTags(event.getMenuTarget());
 		if ("Take".equalsIgnoreCase(option) && isGroundItemAction(event.getMenuAction())
 			&& activeTask != null && config.lootMode() == LootMode.COLLECTED)
 		{
@@ -1197,6 +1201,36 @@ public class SlayerTaskLootPlugin extends Plugin
 			// Soul bearers and similar remote-deposit items transfer inventory to storage.
 			// Re-baseline on the resulting tick so the transfer is never billed as usage.
 			supplyResyncPending = true;
+		}
+
+		if (isAlchemyCast(option, target))
+		{
+			int itemId = event.getItemId();
+			if (itemId <= 0 && event.getWidget() != null)
+			{
+				itemId = event.getWidget().getItemId();
+			}
+			if (itemId <= 0)
+			{
+				final net.runelite.api.ItemContainer inventory =
+					client.getItemContainer(InventoryID.INV);
+				final net.runelite.api.Item item = inventory == null
+					? null
+					: inventory.getItem(event.getParam0());
+				itemId = item == null ? -1 : item.getId();
+			}
+			if (itemId > 0)
+			{
+				supplyTracker.ignoreRemoval(itemId, 1);
+				if (target.toLowerCase(java.util.Locale.ROOT).contains("high level alchemy"))
+				{
+					final int coins = itemManager.getItemComposition(itemId).getHaPrice();
+					if (coins > 0)
+					{
+						alchemyCollectionIgnores.merge(ItemID.COINS, coins, Integer::sum);
+					}
+				}
+			}
 		}
 
 		if ("Drop".equalsIgnoreCase(option)
@@ -1293,6 +1327,16 @@ public class SlayerTaskLootPlugin extends Plugin
 			|| "Deposit".equalsIgnoreCase(option)
 			|| "Bank".equalsIgnoreCase(option)
 			|| "Bank-All".equalsIgnoreCase(option);
+	}
+
+	static boolean isAlchemyCast(String option, String target)
+	{
+		if (!"Cast".equalsIgnoreCase(option) || target == null)
+		{
+			return false;
+		}
+		final String lower = target.toLowerCase(java.util.Locale.ROOT);
+		return lower.contains("high level alchemy") || lower.contains("low level alchemy");
 	}
 
 	@SuppressWarnings("unused")
@@ -1901,6 +1945,7 @@ public class SlayerTaskLootPlugin extends Plugin
 			pendingInventoryGains.clear();
 			pendingPickups.clear();
 			pickupInventoryIgnores.clear();
+			alchemyCollectionIgnores.clear();
 			collectionInventoryDirty = false;
 			return;
 		}
@@ -1918,6 +1963,8 @@ public class SlayerTaskLootPlugin extends Plugin
 					- collectionInventorySnapshot.getOrDefault(entry.getKey(), 0);
 				gained = applyPickupInventoryIgnore(
 					pickupInventoryIgnores, entry.getKey(), gained);
+				gained = applyPickupInventoryIgnore(
+					alchemyCollectionIgnores, entry.getKey(), gained);
 				if (gained > 0)
 				{
 					confirmPickupReachedInventory(entry.getKey());
@@ -1935,6 +1982,7 @@ public class SlayerTaskLootPlugin extends Plugin
 		// arrived before GameTick. Any unused suppression belongs to a direct-to-container
 		// pickup and must not hide a later, unrelated inventory gain.
 		pickupInventoryIgnores.clear();
+		alchemyCollectionIgnores.clear();
 
 		final int collectionRetention = Math.max(
 			CREDIT_MATCH_TOLERANCE, toTicks(config.lootCreditWindow()));
@@ -2039,6 +2087,7 @@ public class SlayerTaskLootPlugin extends Plugin
 		collectionInventoryDirty = false;
 		pendingInventoryGains.clear();
 		pickupInventoryIgnores.clear();
+		alchemyCollectionIgnores.clear();
 	}
 
 	@SuppressWarnings("unused")
@@ -2587,10 +2636,10 @@ public class SlayerTaskLootPlugin extends Plugin
 			displayedSupplies.entrySet().iterator(); it.hasNext(); )
 		{
 			final Map.Entry<Integer, SupplyEntry> entry = it.next();
-			if (supplyTracker.isPrayerRemains(entry.getKey()))
+			if (supplyTracker.isLootOnlyItem(entry.getKey()))
 			{
-				// Older snapshots may already contain bones/ashes as supplies. Hide that
-				// invalid charge immediately as well as preventing new ones at collection.
+				// Older snapshots may already contain prayer remains or ensouled heads as
+				// supplies. Hide that invalid charge as well as preventing new ones.
 				supplyValue -= entry.getValue().getValue();
 				it.remove();
 			}

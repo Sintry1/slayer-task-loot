@@ -28,11 +28,13 @@ public class SupplyTrackerTest
 		assertFalse(SupplyTracker.hasPrayerRemainsAction(
 			new String[] {"Eat", null, null, null, "Drop"}));
 		assertFalse(SupplyTracker.hasPrayerRemainsAction(null));
-		assertTrue(SupplyTracker.isPrayerRemainsName("Malicious ashes"));
-		assertTrue(SupplyTracker.isPrayerRemainsName("Dragon bones"));
-		assertFalse(SupplyTracker.isPrayerRemainsName("Ashes"));
-		assertFalse(SupplyTracker.isPrayerRemainsName("Soda ash"));
-		assertFalse(SupplyTracker.isPrayerRemainsName("Shark"));
+		assertTrue(SupplyTracker.isLootOnlyName("Malicious ashes"));
+		assertTrue(SupplyTracker.isLootOnlyName("Dragon bones"));
+		assertTrue(SupplyTracker.isLootOnlyName("Ensouled abyssal head"));
+		assertFalse(SupplyTracker.isLootOnlyName("Ashes"));
+		assertFalse(SupplyTracker.isLootOnlyName("Soda ash"));
+		assertFalse(SupplyTracker.isLootOnlyName("Shark"));
+		assertFalse(SupplyTracker.isLootOnlyName("Headless arrow"));
 	}
 
 	@Test
