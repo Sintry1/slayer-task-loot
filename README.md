@@ -89,7 +89,7 @@ Implemented but not yet confirmed in game: trident of the swamp, enchanted tride
 
 | Setting | Default | Description |
 |---|---|---|
-| Count loot | Dropped | Count every drop, or only what reaches your inventory |
+| Count loot | Dropped | Count every drop, or only what you pick up (including direct-to-container loot) |
 | Late loot window | 120s | How long after a kill its drop can still count, for bosses whose loot has to be collected (0–600) |
 
 ### Supplies

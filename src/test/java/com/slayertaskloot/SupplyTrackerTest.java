@@ -3,6 +3,7 @@ package com.slayertaskloot;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertTrue;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -17,6 +18,23 @@ import org.junit.Test;
  */
 public class SupplyTrackerTest
 {
+	@Test
+	public void prayerRemainsAreNotSupplies()
+	{
+		assertTrue(SupplyTracker.hasPrayerRemainsAction(
+			new String[] {"Scatter", null, null, null, "Drop"}));
+		assertTrue(SupplyTracker.hasPrayerRemainsAction(
+			new String[] {"Bury", null, null, null, "Drop"}));
+		assertFalse(SupplyTracker.hasPrayerRemainsAction(
+			new String[] {"Eat", null, null, null, "Drop"}));
+		assertFalse(SupplyTracker.hasPrayerRemainsAction(null));
+		assertTrue(SupplyTracker.isPrayerRemainsName("Malicious ashes"));
+		assertTrue(SupplyTracker.isPrayerRemainsName("Dragon bones"));
+		assertFalse(SupplyTracker.isPrayerRemainsName("Ashes"));
+		assertFalse(SupplyTracker.isPrayerRemainsName("Soda ash"));
+		assertFalse(SupplyTracker.isPrayerRemainsName("Shark"));
+	}
+
 	@Test
 	public void parsesDoseSuffixes()
 	{

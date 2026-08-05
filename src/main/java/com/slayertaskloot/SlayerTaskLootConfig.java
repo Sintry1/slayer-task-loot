@@ -83,7 +83,8 @@ public interface SlayerTaskLootConfig extends Config
 		keyName = "lootMode",
 		name = "Count loot",
 		description = TOOLTIP_OPEN
-			+ "Dropped counts every drop. Collected counts only what reaches your inventory."
+			+ "Dropped counts every drop. Collected counts only what you pick up, including "
+			+ "items sent directly to a storage container."
 			+ TOOLTIP_CLOSE,
 		section = lootSection,
 		position = 1
