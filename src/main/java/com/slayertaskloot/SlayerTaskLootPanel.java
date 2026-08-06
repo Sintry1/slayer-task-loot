@@ -484,7 +484,8 @@ class SlayerTaskLootPanel extends PluginPanel
 		final JButton merge = iconButton(MERGE_ICON, MERGE_ICON_HOVER,
 			mergeCandidates.isEmpty()
 			? "No other matching history record is available"
-			: "Combine another matching history record into this one");
+			: "Combine all " + mergeCandidates.size() + " other matching "
+				+ (mergeCandidates.size() == 1 ? "record" : "records") + " into this one");
 		merge.setEnabled(!mergeCandidates.isEmpty());
 		merge.addActionListener(e -> mergeHistoryTask(task, mergeCandidates));
 		actions.add(merge);
@@ -539,41 +540,30 @@ class SlayerTaskLootPanel extends PluginPanel
 		return image;
 	}
 
+	/**
+	 * Pools every matching record into this one, after confirming how many that is.
+	 *
+	 * <p>Confirmed rather than done outright because a merge can't be undone from the panel:
+	 * the sources are folded in and dropped, and separating them again would mean knowing which
+	 * kill and which drop came from where, which nothing records.
+	 */
 	private void mergeHistoryTask(TaskView target, List<TaskView> candidates)
 	{
-		final HistoryChoice[] choices = candidates.stream()
-			.map(HistoryChoice::new)
-			.toArray(HistoryChoice[]::new);
-		final HistoryChoice selected = (HistoryChoice) JOptionPane.showInputDialog(
-			this, "Select the record to combine into this one:", "Merge task history",
-			JOptionPane.PLAIN_MESSAGE, null, choices, choices[choices.length - 1]);
-		if (selected != null)
+		final int answer = JOptionPane.showConfirmDialog(this,
+			"Combine " + candidates.size() + " other " + target.getTaskName() + " "
+				+ (candidates.size() == 1 ? "record" : "records") + " into this one?"
+				+ "\nThis cannot be undone.",
+			"Merge task history", JOptionPane.YES_NO_OPTION);
+		if (answer == JOptionPane.YES_OPTION)
 		{
-			plugin.mergeHistoryTasks(target.getAssignmentId(), selected.task.getAssignmentId());
+			plugin.mergeAllHistoryTasks(target.getAssignmentId());
 		}
 	}
 
+	/** Matches on the monster alone — see SlayerTaskLootPlugin.sameTask(), which must agree. */
 	private static boolean sameTask(TaskView left, TaskView right)
 	{
-		return Objects.equals(left.getTaskName(), right.getTaskName())
-			&& Objects.equals(left.getTaskLocation(), right.getTaskLocation());
-	}
-
-	private static final class HistoryChoice
-	{
-		private final TaskView task;
-
-		private HistoryChoice(TaskView task)
-		{
-			this.task = task;
-		}
-
-		@Override
-		public String toString()
-		{
-			return TIMESTAMP_FMT.format(Instant.ofEpochMilli(task.getEndedAt())
-				.atZone(ZoneId.systemDefault())) + " · " + task.getKills() + " kills";
-		}
+		return Objects.equals(left.getTaskName(), right.getTaskName());
 	}
 
 	/** A section total whose arrow shows and hides the entries making it up. */

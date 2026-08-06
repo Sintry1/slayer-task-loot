@@ -44,6 +44,7 @@ import net.runelite.api.events.ChatMessage;
 import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.GameTick;
 import net.runelite.api.events.GraphicChanged;
+import net.runelite.api.events.HitsplatApplied;
 import net.runelite.api.events.ItemContainerChanged;
 import net.runelite.api.events.ItemDespawned;
 import net.runelite.api.events.MenuOptionClicked;
@@ -125,6 +126,31 @@ public class SlayerTaskLootPlugin extends Plugin
 	private static final int PICKUP_ACTION_EXPIRY_TICKS = 20;
 
 	/** Persist at most this often, in game ticks, so a long task isn't a write per kill. */
+	/**
+	 * Hard ceiling on the grace replay, whatever combat says — ten minutes.
+	 *
+	 * <p>Generous because what it bounds is narrow: the replay only reaches back to the first
+	 * damage dealt to a <em>task-relevant</em> NPC since the last session ended, and supplies
+	 * spent fighting this assignment's monsters belong to this assignment however long it took.
+	 * Gathering a barrage stack is the case that needs the room.
+	 */
+	private static final int MAX_GRACE_TICKS = 1000;
+
+	/**
+	 * How far before a hitsplat the engagement is taken to have started.
+	 *
+	 * <p>A hitsplat is the <em>effect</em>; the supplies were spent making the attack that caused
+	 * it, a tick or more earlier while the projectile was still in the air. Anchoring on the
+	 * hitsplat alone therefore excludes the very thing it is meant to cover, and does so exactly
+	 * once — the first thrown knife of a trip was billed on the tick it left the inventory and
+	 * pruned by an anchor set two ticks later. A cannon doesn't show this because its magazine
+	 * falls on the same tick the shot is billed.
+	 */
+	private static final int COMBAT_LEAD_TICKS = 5;
+
+	/** Largest magazine fall still read as shots fired. Above it, an unload or a pickup. */
+	private static final int MAX_CANNON_SHOTS_PER_TICK = 2;
+
 	private static final int PERSIST_INTERVAL_TICKS = 10;
 
 	/** Refresh the panel at most this often. Supply charges fire far too fast to rebuild on each. */
@@ -328,6 +354,16 @@ public class SlayerTaskLootPlugin extends Plugin
 	private List<TaskView> historyViews = Collections.emptyList();
 	private boolean historyViewsDirty = true;
 
+	/**
+	 * Whether the stored snapshot has already been read for the account currently logged in.
+	 *
+	 * <p>{@link GameState#LOGGED_IN} is not the login event it reads as: it fires again after
+	 * every loading screen — a teleport, a dungeon entrance, a region boundary. Reloading there
+	 * replaced the live record with the last persisted copy and closed its sessions underneath
+	 * a plugin that still believed one was open, which stopped the clock for good.
+	 */
+	private boolean loaded;
+
 	private boolean sessionOpen;
 	private String activeSessionId;
 	private String lastCreditSessionId;
@@ -349,6 +385,21 @@ public class SlayerTaskLootPlugin extends Plugin
 	private final Map<Integer, Long> tomeRemainders = new HashMap<>();
 	private int specialEnergyLastSeen = -1;
 	private long tentacleRemainder;
+
+	/**
+	 * First tick the player damaged a task-relevant NPC since the grace buffer was last emptied,
+	 * or -1 if they haven't yet.
+	 *
+	 * <p>Deliberately not "the current unbroken fight". Gathering a stack to barrage is combat
+	 * with gaps in it — run, aggro, run — and anchoring on the latest streak collapsed the window
+	 * back to the configured default every time the player moved, which is what lost a trip's
+	 * worth of thrown knives. There is nothing to guess here either: the anchor is the first blow
+	 * of the engagement, not a threshold for when one fight becomes two.
+	 */
+	private int combatStartTick = -1;
+
+	/** Previous magazine reading, so a cannon firing can be seen. -1 until the first tick. */
+	private int lastCannonballCount = -1;
 
 	@Provides
 	SlayerTaskLootConfig provideConfig(ConfigManager configManager)
@@ -374,6 +425,7 @@ public class SlayerTaskLootPlugin extends Plugin
 			if (client.getGameState() == GameState.LOGGED_IN)
 			{
 				load();
+				loaded = true;
 				applyChargeConfig();
 				supplyTracker.resync();
 				resyncCollectionInventory();
@@ -399,6 +451,7 @@ public class SlayerTaskLootPlugin extends Plugin
 		history = new ArrayList<>();
 		lastSlayerCount = -1;
 		lastCreditTick = -1;
+		loaded = false;
 		sessionOpen = false;
 		activeSessionId = null;
 		lastCreditSessionId = null;
@@ -416,10 +469,11 @@ public class SlayerTaskLootPlugin extends Plugin
 		alchemyCollectionIgnores.clear();
 		collectionInventorySnapshot = null;
 		collectionInventoryDirty = false;
-		graceBuffer.clear();
+		clearGraceBuffer();
 		openInterfaces.clear();
 		quiverShotTick = -1;
 		specialEnergyLastSeen = -1;
+		lastCannonballCount = -1;
 		supplyTracker.clear();
 	}
 
@@ -452,6 +506,14 @@ public class SlayerTaskLootPlugin extends Plugin
 
 		if (amount <= 0)
 		{
+			// Completion is a transition from a live counter to zero, never the first thing
+			// seen. Without that distinction a counter still reading zero at login would end a
+			// task that is merely being loaded, and archive it on the next varp.
+			if (lastSlayerCount < 0)
+			{
+				return;
+			}
+
 			if (activeTask != null && !activeTask.isCompleted())
 			{
 				// Credit the kill that finished the assignment, then stop. Archiving waits
@@ -476,6 +538,17 @@ public class SlayerTaskLootPlugin extends Plugin
 
 		final String taskLocation = resolveTaskLocation();
 		final int initialAmount = client.getVarpValue(VarPlayerID.SLAYER_COUNT_ORIGINAL);
+		if (initialAmount <= 0)
+		{
+			// Not populated yet, the same situation as an unresolved task name above. It reads
+			// zero for a moment at login, after the counter itself is already live, and taking
+			// that at face value was destructive rather than merely wrong: the size is part of
+			// assignment identity, so a stored task compared against zero looked like a
+			// different assignment, and startTask() archived the real record and replaced it
+			// with an empty one. Seen in the log as a pair of lines a fraction of a second
+			// apart — "Started tracking task: 0x Smoke Devils" then "112x Smoke Devils".
+			return;
+		}
 
 		// Identity has to be settled before any kill is credited. A new assignment whose size
 		// is smaller than what was left on the previous one — a Turael skip — otherwise looks
@@ -668,7 +741,7 @@ public class SlayerTaskLootPlugin extends Plugin
 		activeSessionId = null;
 		lastCreditSessionId = null;
 		lastCreditTick = -1;
-		graceBuffer.clear();
+		clearGraceBuffer();
 		// Anything still awaiting attribution belonged to the assignment just archived, and
 		// must not land on this one.
 		pendingLoot.clear();
@@ -757,20 +830,8 @@ public class SlayerTaskLootPlugin extends Plugin
 		sessionOpen = true;
 		activeSessionId = activeTask.openNewSession(System.currentTimeMillis(), false).getSessionId();
 
-		final int cutoff = client.getTickCount() - toTicks(config.graceWindow());
-		long replayed = 0;
-		for (BufferedCharge charge : graceBuffer)
-		{
-			if (charge.tick >= cutoff)
-			{
-				activeTask.addSupplyCharge(activeSessionId, charge.charge);
-				replayed += charge.charge.getTotal();
-			}
-		}
-		graceBuffer.clear();
-
 		log.debug("Session {} open, replayed {} gp of grace-window supplies",
-			activeTask.getSessions(), replayed);
+			activeTask.getSessions(), replayGraceBuffer(activeSessionId));
 	}
 
 	private void closeSession()
@@ -786,7 +847,7 @@ public class SlayerTaskLootPlugin extends Plugin
 		}
 		sessionOpen = false;
 		activeSessionId = null;
-		graceBuffer.clear();
+		clearGraceBuffer();
 	}
 
 	// ------------------------------------------------------------------
@@ -1363,7 +1424,11 @@ public class SlayerTaskLootPlugin extends Plugin
 	@Subscribe
 	public void onAnimationChanged(AnimationChanged event)
 	{
-		if (!config.trackSupplies() || !sessionOpen || event.getActor() != client.getLocalPlayer())
+		// Not gated on an open session. Attribution is recordSupplyCharge()'s job — it buffers
+		// into the grace window when no session is open yet, and credits the last session when
+		// the kill that closed the task is what spent this. Deciding here instead threw both
+		// away: the first fight of every session is fought before the first kill opens one.
+		if (!config.trackSupplies() || event.getActor() != client.getLocalPlayer())
 		{
 			return;
 		}
@@ -1394,10 +1459,9 @@ public class SlayerTaskLootPlugin extends Plugin
 
 		if (!charge.isEmpty())
 		{
-			activeTask.addSupplyCharge(activeSessionId, charge);
+			recordSupplyCharge(charge);
 			lastWeaponUsageTick = tick;
 			lastWeaponUsageAnimation = animation;
-			markDirty();
 		}
 	}
 
@@ -1492,7 +1556,9 @@ public class SlayerTaskLootPlugin extends Plugin
 	 */
 	private void processRepeatingWeaponUsage(int now)
 	{
-		if (!config.trackSupplies() || !sessionOpen || client.getLocalPlayer() == null
+		// See onAnimationChanged: no session gate here either. Every branch below already routes
+		// through recordSupplyCharge(), which is what knows where a charge belongs.
+		if (!config.trackSupplies() || client.getLocalPlayer() == null
 			|| client.getLocalPlayer().getAnimationFrame() != 0
 			|| now == lastWeaponUsageTick)
 		{
@@ -2147,6 +2213,7 @@ public class SlayerTaskLootPlugin extends Plugin
 	public void onGameTick(GameTick event)
 	{
 		final int now = client.getTickCount();
+		processCannonCombat(now);
 		processRepeatingWeaponUsage(now);
 		processSpecialAttackCharges(now);
 		processQuiverSplinters(now);
@@ -2161,7 +2228,22 @@ public class SlayerTaskLootPlugin extends Plugin
 
 		if (sessionOpen && activeTask != null)
 		{
-			activeTask.tickSession(activeSessionId);
+			if (!activeTask.tickSession(activeSessionId))
+			{
+				// The record says that session is closed while we still think it's running.
+				// Left alone the clock stops permanently, because openSession() sees
+				// sessionOpen and returns without opening anything — which is how a reload
+				// underneath an open session read as a frozen timer. Reopen the session if it
+				// still exists, and otherwise let the next kill start a fresh one.
+				log.debug("Session {} closed under an open tracker, reopening", activeSessionId);
+				if (activeSessionId == null
+					|| activeTask.resumeSession(activeSessionId, System.currentTimeMillis()) == null)
+				{
+					sessionOpen = false;
+					activeSessionId = null;
+				}
+				markDirty();
+			}
 			// The panel shows elapsed time off this counter, so an open session is always
 			// behind the live state even when nothing else happened. Without this the clock
 			// only moved when a kill or a drop happened to mark the panel dirty, and read as
@@ -2211,9 +2293,141 @@ public class SlayerTaskLootPlugin extends Plugin
 		panelDirty = true;
 	}
 
+	/**
+	 * Notes damage the player dealt to something this assignment cares about, so the grace window
+	 * can cover the whole of the fight that produced the first kill rather than a fixed number of
+	 * seconds before it.
+	 *
+	 * <p>Restricted to task-relevant NPCs on purpose. Any-combat would let ten minutes of unbroken
+	 * fighting against something else — a raid, another boss — carry the window back to its ceiling
+	 * and bill all of it to the task the moment one on-task kill finally landed. Damage taken is not
+	 * counted either, since a hitsplat on the player doesn't say what put it there.
+	 */
+	@SuppressWarnings("unused")
+	@Subscribe
+	public void onHitsplatApplied(HitsplatApplied event)
+	{
+		if (!event.getHitsplat().isMine() || !(event.getActor() instanceof NPC))
+		{
+			return;
+		}
+		if (isTaskRelevant(((NPC) event.getActor()).getName()))
+		{
+			noteCombat(client.getTickCount());
+		}
+	}
+
+	/**
+	 * Whether an NPC is one this assignment counts, by the same rule the loot credit uses: already
+	 * confirmed by a counter change, or matching the assignment name and its aliases. The alias
+	 * table is what makes Araxxor count on an araxyte task, which is the case this exists for.
+	 */
+	private boolean isTaskRelevant(@Nullable String npcName)
+	{
+		if (activeTask == null || npcName == null)
+		{
+			return false;
+		}
+		final String name = Text.removeTags(npcName);
+		return confirmedTargets.contains(name)
+			|| SlayerTaskTargets.matches(activeTask.getTaskName(), name);
+	}
+
+	/**
+	 * A cannon firing is the player fighting, even when they never attack anything themselves.
+	 *
+	 * <p>The magazine is a varp of the player's own cannon, so nobody else's can move it. It can't
+	 * say what was being shot at, though, so unlike {@link #onHitsplatApplied} this can't be
+	 * restricted to task-relevant targets — the ceiling on the replay is what bounds it. A fall of
+	 * more than a shot or two is an unload or a pickup rather than firing, and isn't combat.
+	 */
+	private void processCannonCombat(int now)
+	{
+		final int balls = client.getVarpValue(VarPlayerID.ROCKTHROWER);
+		final int previous = lastCannonballCount;
+		lastCannonballCount = balls;
+		if (previous > balls && previous - balls <= MAX_CANNON_SHOTS_PER_TICK)
+		{
+			noteCombat(now);
+		}
+	}
+
+	private void noteCombat(int now)
+	{
+		if (combatStartTick < 0)
+		{
+			combatStartTick = Math.max(0, now - COMBAT_LEAD_TICKS);
+		}
+	}
+
+	/**
+	 * Earliest tick a buffered charge may still be replayed from.
+	 *
+	 * <p>The configured window measures backwards from now, which asks the wrong question when
+	 * fights differ in length: Araxxor takes about a minute where a regular araxyte takes ten or
+	 * twenty seconds, and on the same assignment the supplies that paid for the kill shouldn't
+	 * depend on which one was chosen. So the fight itself extends the window when it is longer —
+	 * never shortens it — and a hard ceiling stops an unbroken run of combat reaching back forever.
+	 *
+	 * <p>A grace window of zero means what it says and is left alone; nothing is buffered at all in
+	 * that case.
+	 */
+	static int graceCutoff(int now, int graceTicks, int combatStartTick, int maxTicks)
+	{
+		if (graceTicks <= 0)
+		{
+			return now;
+		}
+
+		int cutoff = now - graceTicks;
+		if (combatStartTick >= 0 && combatStartTick < cutoff)
+		{
+			cutoff = combatStartTick;
+		}
+		return Math.max(cutoff, now - maxTicks);
+	}
+
+	private int graceCutoff()
+	{
+		return graceCutoff(client.getTickCount(), toTicks(config.graceWindow()),
+			combatStartTick, MAX_GRACE_TICKS);
+	}
+
+	/**
+	 * Credits everything the grace window still covers to the session just opened, and empties the
+	 * buffer either way.
+	 *
+	 * @return the value replayed, for logging
+	 */
+	private long replayGraceBuffer(String sessionId)
+	{
+		final int cutoff = graceCutoff();
+		long replayed = 0;
+		for (BufferedCharge charge : graceBuffer)
+		{
+			if (charge.tick >= cutoff)
+			{
+				activeTask.addSupplyCharge(sessionId, charge.charge);
+				replayed += charge.charge.getTotal();
+			}
+		}
+		clearGraceBuffer();
+		return replayed;
+	}
+
+	/**
+	 * Empties the buffer and forgets where the engagement started, so the next one anchors itself
+	 * rather than inheriting an anchor from work already accounted for.
+	 */
+	private void clearGraceBuffer()
+	{
+		graceBuffer.clear();
+		combatStartTick = -1;
+	}
+
 	private void pruneGraceBuffer(int now)
 	{
-		final int cutoff = now - toTicks(config.graceWindow());
+		final int cutoff = graceCutoff();
 		while (!graceBuffer.isEmpty() && graceBuffer.peekFirst().tick < cutoff)
 		{
 			graceBuffer.removeFirst();
@@ -2238,6 +2452,22 @@ public class SlayerTaskLootPlugin extends Plugin
 
 		if (state == GameState.LOGGED_IN)
 		{
+			// LOGGED_IN is not the login event its name suggests: it fires again after every
+			// loading screen — a teleport, a dungeon entrance, a region boundary. Everything
+			// below belongs to an actual login, and running it on a region change did real
+			// damage. load() replaced the live record with the last persisted copy, discarding
+			// up to a persist interval of loot, and closed its sessions underneath a plugin
+			// that still believed one was open — after which tickSession() no-oped and
+			// openSession() returned early on sessionOpen, so the clock stopped for good. The
+			// resyncs were just as wrong: re-baselining across a teleport means the runes that
+			// paid for it are never billed, which is exactly what the grace window exists to
+			// catch.
+			if (loaded)
+			{
+				return;
+			}
+			loaded = true;
+
 			load();
 
 			// A task that finished before logging out has no loot still to arrive, and its
@@ -2257,6 +2487,7 @@ public class SlayerTaskLootPlugin extends Plugin
 		}
 		else if (state == GameState.LOGIN_SCREEN || state == GameState.HOPPING)
 		{
+			loaded = false;
 			closeSession(state == GameState.HOPPING ? "WORLD_HOP" : "LOGOUT");
 			persist();
 			// Tick counts don't carry across a session, so anchors measured in ticks are
@@ -2269,6 +2500,8 @@ public class SlayerTaskLootPlugin extends Plugin
 			lastSlayerCount = -1;
 			quiverShotTick = -1;
 			specialEnergyLastSeen = -1;
+			// Tick-count anchors, so meaningless once the count restarts.
+			lastCannonballCount = -1;
 			supplyTracker.clear();
 			pendingLoot.clear();
 			recentDeaths.clear();
@@ -2294,6 +2527,12 @@ public class SlayerTaskLootPlugin extends Plugin
 		clientThread.invokeLater(() ->
 		{
 			applyChargeConfig();
+			// Stored tasks are rendered once and reused, on the assumption that only the active
+			// task changes between refreshes. Settings break that assumption: "Net matching
+			// drops" and "Track supplies and profit" both change how every past task reads, and
+			// without this the history kept showing the old view until something else happened
+			// to rebuild it — which makes the setting look like it does nothing.
+			historyViewsDirty = true;
 			if (trim)
 			{
 				trimHistory();
@@ -2303,8 +2542,12 @@ public class SlayerTaskLootPlugin extends Plugin
 			{
 				// Rebaseline on the way back in. Without this, everything used while tracking
 				// was off would land on the task the moment it's switched on.
+				//
+				// Only the supply baseline. Collection tracking is independent of this setting,
+				// and resyncing it here cleared pendingInventoryGains — so toggling a supply
+				// setting silently dropped any loot picked up but not yet matched to its drop,
+				// in Collected mode only.
 				supplyTracker.resync();
-				resyncCollectionInventory();
 			}
 			if (lootModeChanged)
 			{
@@ -2412,8 +2655,11 @@ public class SlayerTaskLootPlugin extends Plugin
 			activeSessionId = activeTask.openNewSession(System.currentTimeMillis(), true).getSessionId();
 			lastCreditSessionId = activeSessionId;
 			lastCreditTick = client.getTickCount();
-			graceBuffer.clear();
-			supplyTracker.resync();
+			// Replayed, not discarded. Starting the session by hand used to throw the grace
+			// window away and re-baseline on top, so everything spent getting to the first kill
+			// — cannonballs above all, which fire long before the counter moves — was lost. The
+			// button says when the session starts, not that the run-up was free.
+			replayGraceBuffer(activeSessionId);
 			markDirty();
 			pushToPanel();
 		});
@@ -2460,8 +2706,9 @@ public class SlayerTaskLootPlugin extends Plugin
 			lastCreditSessionId = activeSessionId;
 			sessionOpen = true;
 			lastCreditTick = client.getTickCount();
-			graceBuffer.clear();
-			supplyTracker.resync();
+			// Same as startNewSession(): resuming by hand is still a session opening, and the
+			// grace window belongs to it.
+			replayGraceBuffer(activeSessionId);
 			markDirty();
 			pushToPanel();
 		});
@@ -2506,23 +2753,49 @@ public class SlayerTaskLootPlugin extends Plugin
 		});
 	}
 
-	void mergeHistoryTasks(String targetAssignmentId, String sourceAssignmentId)
+	/**
+	 * Pools every other history record of the same assignment into this one.
+	 *
+	 * <p>Merging was one record at a time, chosen from a dialog. Combining a dozen trips of the
+	 * same monster meant a dozen round trips through it, and the choice was rarely a real one:
+	 * the records offered were already filtered to those that match, so picking between them
+	 * only decided the order they arrived in.
+	 */
+	void mergeAllHistoryTasks(String targetAssignmentId)
 	{
 		clientThread.invokeLater(() ->
 		{
 			final TaskLootRecord target = findHistoryTask(targetAssignmentId);
-			final TaskLootRecord source = findHistoryTask(sourceAssignmentId);
-			if (target == null || source == null || target == source || !sameTask(target, source))
+			if (target == null)
 			{
 				return;
 			}
 
-			target.mergeRecord(source);
-			history.remove(source);
+			// Snapshot first: mergeRecord() folds each source into the target and the source is
+			// then dropped, so iterating history itself while removing from it would skip entries.
+			final List<TaskLootRecord> sources = new ArrayList<>();
+			for (TaskLootRecord candidate : history)
+			{
+				if (candidate != target && sameTask(target, candidate))
+				{
+					sources.add(candidate);
+				}
+			}
+			if (sources.isEmpty())
+			{
+				return;
+			}
+
+			for (TaskLootRecord source : sources)
+			{
+				target.mergeRecord(source);
+			}
+			history.removeAll(sources);
 			historyViewsDirty = true;
 			markDirty();
 			persist();
 			pushToPanel();
+			log.debug("Merged {} history records into {}", sources.size(), target.getTaskName());
 		});
 	}
 
@@ -2554,10 +2827,17 @@ public class SlayerTaskLootPlugin extends Plugin
 		return null;
 	}
 
+	/**
+	 * Whether two records are the same assignment for the purpose of combining them by hand.
+	 *
+	 * <p>The monster alone, deliberately. Location is part of assignment <em>identity</em> — it
+	 * is what stops two consecutive tasks being read as one — but it isn't what makes two
+	 * records worth pooling. The same creature killed in a different place is the same creature,
+	 * and combining them is only ever the user asking for it explicitly.
+	 */
 	private static boolean sameTask(TaskLootRecord left, TaskLootRecord right)
 	{
-		return Objects.equals(left.getTaskName(), right.getTaskName())
-			&& Objects.equals(left.getTaskLocation(), right.getTaskLocation());
+		return Objects.equals(left.getTaskName(), right.getTaskName());
 	}
 
 	void clearHistory()

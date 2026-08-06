@@ -25,6 +25,33 @@ public class LootBufferTest
 		assertEquals(100, buffered.get(0).getQuantity());
 	}
 
+	/**
+	 * A fight longer than the configured window still counts as one fight, so an Araxxor kill
+	 * doesn't lose the supplies that paid for it while a regular araxyte keeps them.
+	 */
+	@Test
+	public void graceWindowStretchesToCoverTheCurrentFight()
+	{
+		// 50-tick window, fight started 120 ticks ago: the fight wins.
+		assertEquals(80, SlayerTaskLootPlugin.graceCutoff(200, 50, 80, 500));
+
+		// Short fight inside the window: the window wins, never shortened by combat.
+		assertEquals(150, SlayerTaskLootPlugin.graceCutoff(200, 50, 190, 500));
+
+		// Not in combat at all.
+		assertEquals(150, SlayerTaskLootPlugin.graceCutoff(200, 50, -1, 500));
+
+		// An unbroken streak can't reach back past the ceiling.
+		assertEquals(500, SlayerTaskLootPlugin.graceCutoff(1000, 50, 20, 500));
+
+		// A window of zero means what it says.
+		assertEquals(200, SlayerTaskLootPlugin.graceCutoff(200, 0, 20, 500));
+
+		// The anchor is back-dated to before the attack that produced the first hitsplat, so a
+		// charge on the throwing tick still falls inside it rather than one tick outside.
+		assertEquals(78, SlayerTaskLootPlugin.graceCutoff(200, 50, 78, 500));
+	}
+
 	@Test
 	public void resolvesLoadedBlowpipeDartNames()
 	{
