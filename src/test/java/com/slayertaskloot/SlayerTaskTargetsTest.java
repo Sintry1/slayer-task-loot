@@ -14,6 +14,9 @@ public class SlayerTaskTargetsTest
 		assertTrue(SlayerTaskTargets.matches("Dust devils", "Choke devil"));
 		assertTrue(SlayerTaskTargets.matches("Blue dragons", "Vorkath"));
 		assertTrue(SlayerTaskTargets.matches("Araxytes", "Araxxor"));
+		// Shares no word with its assignment, so only the alias can connect the two.
+		assertTrue(SlayerTaskTargets.matches("Rats", "Scurrius"));
+		assertTrue(SlayerTaskTargets.matches("Rats", "Giant rat"));
 	}
 
 	@Test

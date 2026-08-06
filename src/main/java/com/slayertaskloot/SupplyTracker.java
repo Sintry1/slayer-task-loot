@@ -10,6 +10,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import javax.inject.Inject;
+import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.api.EnumComposition;
 import net.runelite.api.EnumID;
@@ -52,6 +53,7 @@ import net.runelite.http.api.item.ItemPrice;
 	 * They're still listed at zero gp when consumed, so that a supply which is tracked but free
 	 * doesn't look identical to one that isn't tracked at all.
  */
+@Slf4j
 class SupplyTracker
 {
 	/**
@@ -329,6 +331,7 @@ class SupplyTracker
 			}
 		}
 
+		final Map<Integer, Integer> snapshotBefore = snapshot;
 		snapshot = current;
 
 		long total = 0;
@@ -399,6 +402,30 @@ class SupplyTracker
 		}
 
 		expireIgnoredRemovals();
+		if (!rows.isEmpty() && log.isDebugEnabled())
+		{
+			// Every charge, with the raw per-id deltas behind it. A charge that shouldn't have
+			// happened is otherwise indistinguishable from one that should: the panel shows the
+			// same row either way, and netting hides it entirely once loot cancels it out.
+			// Printing what the diff actually saw is what settled the CHARGES_* block, and it's
+			// the only way to tell "the pouch wasn't in the snapshot this tick" apart from
+			// "these runes really were spent".
+			for (SupplyCharge.Row row : rows)
+			{
+				log.debug("charged {} x{} for {} gp", itemName(row.getItemId()), row.getQuantity(),
+					row.getValue());
+			}
+			for (Integer id : ids)
+			{
+				final int before = snapshotBefore.getOrDefault(id, 0);
+				final int after = current.getOrDefault(id, 0);
+				if (before != after)
+				{
+					log.debug("  diff {} ({}) {} -> {}", itemName(id), id, before, after);
+				}
+			}
+			logRunePouch();
+		}
 		return total <= 0 && rows.isEmpty() ? SupplyCharge.EMPTY : new SupplyCharge(total, rows);
 	}
 
@@ -786,6 +813,36 @@ class SupplyTracker
 			// Noted stacks price the same as the base item, and resolving them keeps a
 			// withdraw-as-note from looking like a different item than what gets used.
 			out.merge(itemManager.canonicalize(id), item.getQuantity(), Integer::sum);
+		}
+	}
+
+	/**
+	 * The pouch as the snapshot sees it, slot by slot, including slots it decided to skip.
+	 *
+	 * <p>Runes moving from the inventory into the pouch should be invisible to a charge: both
+	 * sides are in one snapshot keyed by item id, so the transfer nets to zero and no family is
+	 * ever built. A charge for pouched runes therefore means this read came back missing them,
+	 * and only the raw slot values say which of type, quantity or the enum lookup was the one
+	 * that failed.
+	 */
+	private void logRunePouch()
+	{
+		final EnumComposition runes = client.getEnum(EnumID.RUNEPOUCH_RUNE);
+		if (runes == null)
+		{
+			log.debug("  pouch enum RUNEPOUCH_RUNE unavailable, pouch contributed nothing");
+			return;
+		}
+		for (int slot = 0; slot < RUNE_POUCH_TYPE_VARBITS.length; slot++)
+		{
+			final int type = client.getVarbitValue(RUNE_POUCH_TYPE_VARBITS[slot]);
+			final int quantity = client.getVarbitValue(RUNE_POUCH_QUANTITY_VARBITS[slot]);
+			if (type == 0 && quantity == 0)
+			{
+				continue;
+			}
+			log.debug("  pouch slot {} type {} -> item {} x{}", slot + 1, type,
+				runes.getIntValue(type), quantity);
 		}
 	}
 

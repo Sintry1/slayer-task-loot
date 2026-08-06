@@ -72,6 +72,9 @@ final class SlayerTaskTargets
 		aliases.put("ogres", Arrays.asList("Enclave guard", "Mogre", "Ogress", "Skogre", "Zogre"));
 		aliases.put("pirates", Arrays.asList("Pirate"));
 		aliases.put("pyrefiends", Arrays.asList("Flaming pyrelord"));
+		// Not in RuneLite's table. Scurrius counts for a rat assignment and shares no word with
+		// it, so without this its kills and its drops are both invisible to the task.
+		aliases.put("rats", Arrays.asList("Scurrius"));
 		aliases.put("scabarites", Arrays.asList("Scarab swarm", "Locust rider", "Scarab mage", "Small Scarab"));
 		aliases.put("scorpions", Arrays.asList("Scorpia", "Lobstrosity"));
 		aliases.put("shades", Arrays.asList("Loar", "Phrin", "Riyl", "Asyn", "Fiyr", "Urium"));

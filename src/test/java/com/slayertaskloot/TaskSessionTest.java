@@ -28,6 +28,29 @@ public class TaskSessionTest
 		assertFalse(session.isOpen());
 	}
 
+	/**
+	 * The tick loop repairs this rather than absorbing it. A reload closing the record's
+	 * sessions while the plugin still believed one was open used to stop the panel clock for
+	 * good, since opening is guarded on that same belief.
+	 */
+	@Test
+	public void tickingReportsWhenTheSessionIsNotActuallyOpen()
+	{
+		final TaskLootRecord task = new TaskLootRecord("Smoke devils", null, 150, 1L);
+		final TaskSession session = task.openNewSession(10L, false);
+
+		assertTrue(task.tickSession(session.getSessionId()));
+		assertFalse(task.tickSession("a session this task has never held"));
+
+		task.closeOpenSessions(20L, "CLIENT_RESTART");
+		assertFalse(task.tickSession(session.getSessionId()));
+		assertEquals(1, task.getOnTaskTicks());
+
+		task.resumeSession(session.getSessionId(), 30L);
+		assertTrue(task.tickSession(session.getSessionId()));
+		assertEquals(2, task.getOnTaskTicks());
+	}
+
 	@Test
 	public void automaticOpenCreatesDistinctSession()
 	{

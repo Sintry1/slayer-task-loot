@@ -313,16 +313,28 @@ class TaskLootRecord
 		}
 	}
 
-	void tickSession(String sessionId)
+	/**
+	 * Advances the named session's clock by one tick.
+	 *
+	 * @return whether a session by that name was found and was open. False means the caller's
+	 * belief that a session is running disagrees with the record, which is worth repairing
+	 * rather than absorbing: a closed session ticks nothing, and the panel's clock simply stops.
+	 */
+	boolean tickSession(String sessionId)
 	{
 		for (TaskSession session : getTaskSessions())
 		{
 			if (session.getSessionId().equals(sessionId))
 			{
+				if (!session.isOpen())
+				{
+					return false;
+				}
 				session.tick();
-				return;
+				return true;
 			}
 		}
+		return false;
 	}
 
 	boolean mergeSessions(String targetId, String sourceId)
