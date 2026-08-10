@@ -386,6 +386,7 @@ public class SlayerTaskLootPlugin extends Plugin
 	private int lastWeaponUsageTick = -1;
 	private int lastWeaponUsageAnimation = -1;
 	private long scytheVialRemainder;
+	private int scytheAttacks;
 	private int loadedBlowpipeDartId = -1;
 	private int blowpipeDartRemainder;
 	private int blowpipeScaleRemainder;
@@ -1463,12 +1464,26 @@ public class SlayerTaskLootPlugin extends Plugin
 		SupplyCharge charge = SupplyCharge.EMPTY;
 		if (animation == 8056 && isScythe(weaponId))
 		{
-			// A hundred attacks to a vial, so the vial is carried as fractional gp rather than
-			// as a component quantity that would read as zero on every individual attack.
+			// A hundred attacks to a vial. The vial is billed smoothly, ~1/100 of its price per
+			// swing, so the running cost tracks each attack instead of jumping every hundredth one.
 			final long vialNumerator = itemManager.getItemPrice(ItemID.VIAL_BLOOD) + scytheVialRemainder;
 			final long vialCost = vialNumerator / 100L;
 			scytheVialRemainder = vialNumerator % 100L;
-			charge = supplyTracker.chargedItemUse(weaponId, vialCost, ItemID.BLOODRUNE, 2);
+
+			if (++scytheAttacks >= 100)
+			{
+				// A whole vial has now been used, so surface it in the breakdown. Its full price is
+				// added as a component, so remove that from the smoothed cost to avoid double billing
+				// — this swing still only adds its ~1/100 share to the total.
+				scytheAttacks -= 100;
+				charge = supplyTracker.chargedItemUse(weaponId,
+					vialCost - itemManager.getItemPrice(ItemID.VIAL_BLOOD),
+					ItemID.BLOODRUNE, 2, ItemID.VIAL_BLOOD, 1);
+			}
+			else
+			{
+				charge = supplyTracker.chargedItemUse(weaponId, vialCost, ItemID.BLOODRUNE, 2);
+			}
 		}
 		else if (animation == 9493 && weaponId == ItemID.TUMEKENS_SHADOW)
 		{

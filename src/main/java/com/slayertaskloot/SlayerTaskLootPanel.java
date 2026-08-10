@@ -60,6 +60,8 @@ class SlayerTaskLootPanel extends PluginPanel
 	private static final ImageIcon RESUME_ICON_HOVER;
 	private static final ImageIcon MERGE_ICON;
 	private static final ImageIcon MERGE_ICON_HOVER;
+	private static final ImageIcon EXPANDED_ICON;
+	private static final ImageIcon COLLAPSED_ICON;
 
 	static
 	{
@@ -82,6 +84,8 @@ class SlayerTaskLootPanel extends PluginPanel
 		RESUME_ICON_HOVER = new ImageIcon(ImageUtil.luminanceOffset(resume, -80));
 		MERGE_ICON = new ImageIcon(merge);
 		MERGE_ICON_HOVER = new ImageIcon(ImageUtil.luminanceOffset(merge, -80));
+		EXPANDED_ICON = new ImageIcon(buildArrowIcon(true));
+		COLLAPSED_ICON = new ImageIcon(buildArrowIcon(false));
 	}
 
 	private final SlayerTaskLootPlugin plugin;
@@ -536,6 +540,40 @@ class SlayerTaskLootPanel extends PluginPanel
 		return button;
 	}
 
+	/**
+	 * The section arrow, drawn as a filled triangle rather than a Unicode glyph.
+	 *
+	 * <p>The RuneScape font has no triangle characters, so a literal "▸"/"▾" only renders when the
+	 * user's machine happens to have a fallback font that covers it — otherwise it shows as a tofu
+	 * box. Drawing the shape ourselves makes the arrow look the same on every install.
+	 */
+	private static BufferedImage buildArrowIcon(boolean expanded)
+	{
+		final BufferedImage image = new BufferedImage(8, 8, BufferedImage.TYPE_INT_ARGB);
+		final java.awt.Graphics2D graphics = image.createGraphics();
+		graphics.setRenderingHint(java.awt.RenderingHints.KEY_ANTIALIASING,
+			java.awt.RenderingHints.VALUE_ANTIALIAS_ON);
+		graphics.setColor(Color.LIGHT_GRAY);
+		final java.awt.Polygon triangle = new java.awt.Polygon();
+		if (expanded)
+		{
+			// Pointing down.
+			triangle.addPoint(1, 2);
+			triangle.addPoint(7, 2);
+			triangle.addPoint(4, 6);
+		}
+		else
+		{
+			// Pointing right.
+			triangle.addPoint(2, 1);
+			triangle.addPoint(6, 4);
+			triangle.addPoint(2, 7);
+		}
+		graphics.fillPolygon(triangle);
+		graphics.dispose();
+		return image;
+	}
+
 	private static BufferedImage buildMergeIcon()
 	{
 		final BufferedImage image = new BufferedImage(14, 14, BufferedImage.TYPE_INT_ARGB);
@@ -587,7 +625,9 @@ class SlayerTaskLootPanel extends PluginPanel
 		panel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
 		panel.setAlignmentX(Component.LEFT_ALIGNMENT);
 
-		final JButton toggle = new JButton((expanded ? "▾ " : "▸ ") + label);
+		final JButton toggle = new JButton(label);
+		toggle.setIcon(expanded ? EXPANDED_ICON : COLLAPSED_ICON);
+		toggle.setIconTextGap(4);
 		toggle.setFont(FontManager.getRunescapeSmallFont());
 		toggle.setForeground(Color.LIGHT_GRAY);
 		toggle.setBorderPainted(false);
