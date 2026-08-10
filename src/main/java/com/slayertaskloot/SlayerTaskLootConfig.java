@@ -94,6 +94,53 @@ public interface SlayerTaskLootConfig extends Config
 		return LootMode.DROPPED;
 	}
 
+	@ConfigSection(
+		name = "All-task exclusions",
+		description = "Drops excluded from every slayer task",
+		position = 2
+	)
+	String allTaskExclusionsSection = "allTaskExclusions";
+
+	@ConfigItem(
+		keyName = "globalExcludedDrops",
+		name = "Excluded drops",
+		description = TOOLTIP_OPEN
+			+ "Drop names excluded from every task, separated with semicolons. Exclusions can "
+			+ "also be managed from the Drops section in the side panel. Excluded drops continue "
+			+ "tracking invisibly, so including one again restores its complete total."
+			+ TOOLTIP_CLOSE,
+		section = allTaskExclusionsSection,
+		position = 0
+	)
+	default String globalExcludedDrops()
+	{
+		return "";
+	}
+
+	@ConfigSection(
+		name = "Per-task exclusions",
+		description = "Drops excluded only from particular slayer tasks",
+		position = 3
+	)
+	String perTaskExclusionsSection = "perTaskExclusions";
+
+	@ConfigItem(
+		keyName = "taskExcludedDrops",
+		name = "Excluded drops",
+		description = TOOLTIP_OPEN
+			+ "Group drops as Task: Item, Item. Separate tasks with semicolons, for example "
+			+ "Hydras: Hydra bones, Coins; Gargoyles: Granite maul. "
+			+ "Exclusions can also be managed from the Drops section in the side panel. Excluded "
+			+ "drops continue tracking invisibly and return with their complete total."
+			+ TOOLTIP_CLOSE,
+		section = perTaskExclusionsSection,
+		position = 0
+	)
+	default String taskExcludedDrops()
+	{
+		return "";
+	}
+
 	// -------------------------------------------------------------------------
 	// Supplies
 	// -------------------------------------------------------------------------
@@ -101,7 +148,7 @@ public interface SlayerTaskLootConfig extends Config
 	@ConfigSection(
 		name = "Supplies",
 		description = "What supply usage counts toward the task",
-		position = 2
+		position = 4
 	)
 	String suppliesSection = "supplies";
 
@@ -173,7 +220,7 @@ public interface SlayerTaskLootConfig extends Config
 	@ConfigSection(
 		name = "Charged items",
 		description = "What your charged items are filled with",
-		position = 3
+		position = 5
 	)
 	String chargedItemsSection = "chargedItems";
 

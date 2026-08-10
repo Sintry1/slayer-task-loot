@@ -7,6 +7,8 @@ import java.awt.Dimension;
 import java.awt.Font;
 import java.awt.FlowLayout;
 import java.awt.GridLayout;
+import java.awt.LayoutManager;
+import java.awt.Rectangle;
 import java.awt.image.BufferedImage;
 import java.time.Instant;
 import java.time.ZoneId;
@@ -19,17 +21,22 @@ import javax.swing.BoxLayout;
 import javax.swing.Icon;
 import javax.swing.ImageIcon;
 import javax.swing.JButton;
+import javax.swing.JComponent;
 import javax.swing.JLabel;
+import javax.swing.JMenuItem;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
+import javax.swing.JPopupMenu;
 import javax.swing.JScrollPane;
 import javax.swing.JTabbedPane;
 import javax.swing.ScrollPaneConstants;
+import javax.swing.Scrollable;
 import javax.swing.SwingConstants;
 import javax.swing.border.EmptyBorder;
 import javax.swing.border.MatteBorder;
 import net.runelite.client.game.ItemManager;
 import net.runelite.client.ui.ColorScheme;
+import net.runelite.client.ui.DynamicGridLayout;
 import net.runelite.client.ui.FontManager;
 import net.runelite.client.ui.PluginPanel;
 import net.runelite.client.util.AsyncBufferedImage;
@@ -129,11 +136,11 @@ class SlayerTaskLootPanel extends PluginPanel
 
 	private JPanel buildCurrentTab()
 	{
-		currentContainer.setLayout(new BoxLayout(currentContainer, BoxLayout.Y_AXIS));
+		currentContainer.setLayout(new DynamicGridLayout(0, 1));
 		currentContainer.setBackground(ColorScheme.DARK_GRAY_COLOR);
 		currentContainer.setBorder(new EmptyBorder(4, 8, 8, 8));
 
-		final JPanel wrapper = new JPanel(new BorderLayout());
+		final JPanel wrapper = new ViewportWidthPanel(new BorderLayout());
 		wrapper.setBackground(ColorScheme.DARK_GRAY_COLOR);
 		wrapper.add(currentContainer, BorderLayout.NORTH);
 
@@ -146,7 +153,7 @@ class SlayerTaskLootPanel extends PluginPanel
 
 	private JPanel buildHistoryTab()
 	{
-		historyContainer.setLayout(new BoxLayout(historyContainer, BoxLayout.Y_AXIS));
+		historyContainer.setLayout(new DynamicGridLayout(0, 1));
 		historyContainer.setBackground(ColorScheme.DARK_GRAY_COLOR);
 		historyContainer.setBorder(new EmptyBorder(4, 8, 8, 8));
 
@@ -155,7 +162,7 @@ class SlayerTaskLootPanel extends PluginPanel
 		historyHeaderLabel.setForeground(Color.LIGHT_GRAY);
 		historyHeaderLabel.setBorder(new EmptyBorder(6, 8, 2, 8));
 
-		final JPanel wrapper = new JPanel(new BorderLayout());
+		final JPanel wrapper = new ViewportWidthPanel(new BorderLayout());
 		wrapper.setBackground(ColorScheme.DARK_GRAY_COLOR);
 		wrapper.add(historyContainer, BorderLayout.NORTH);
 
@@ -335,7 +342,9 @@ class SlayerTaskLootPanel extends PluginPanel
 	private JPanel buildTaskBox(TaskView task, boolean isCurrent)
 	{
 		final JPanel box = new JPanel();
-		box.setLayout(new BoxLayout(box, BoxLayout.Y_AXIS));
+		// DynamicGridLayout gives every row the card's full width. BoxLayout respects each
+		// row's preferred/maximum width and can recenter the entire card as sections expand.
+		box.setLayout(new DynamicGridLayout(0, 1));
 		box.setBackground(ColorScheme.DARKER_GRAY_COLOR);
 		box.setBorder(new EmptyBorder(6, 6, 6, 6));
 		box.setAlignmentX(Component.LEFT_ALIGNMENT);
@@ -379,6 +388,10 @@ class SlayerTaskLootPanel extends PluginPanel
 		if (dropsExpanded && !task.getRows().isEmpty())
 		{
 			box.add(buildItemGrid(task));
+		}
+		if (dropsExpanded && !task.getExcludedDrops().isEmpty())
+		{
+			box.add(buildExcludedDropsControl(task));
 		}
 
 		if (config.trackSupplies())
@@ -605,13 +618,13 @@ class SlayerTaskLootPanel extends PluginPanel
 
 		for (TaskView.LootRow item : task.getRows())
 		{
-			list.add(buildItemRow(item));
+			list.add(buildItemRow(task, item));
 		}
 
 		return list;
 	}
 
-	private JPanel buildItemRow(TaskView.LootRow item)
+	private JPanel buildItemRow(TaskView task, TaskView.LootRow item)
 	{
 		final JPanel row = new JPanel(new BorderLayout(4, 0));
 		row.setBackground(ColorScheme.DARKER_GRAY_COLOR);
@@ -657,7 +670,71 @@ class SlayerTaskLootPanel extends PluginPanel
 		row.add(text, BorderLayout.CENTER);
 		row.setToolTipText(item.getName() + " — " + QuantityFormatter.formatNumber(item.getValue()) + " gp");
 
+		final JPopupMenu menu = new JPopupMenu();
+		final JMenuItem excludeTask = new JMenuItem("Exclude from task");
+		excludeTask.addActionListener(e ->
+			plugin.excludeDropForTask(task.getTaskName(), item.getName()));
+		menu.add(excludeTask);
+		final JMenuItem excludeAll = new JMenuItem("Exclude from all tasks");
+		excludeAll.addActionListener(e -> plugin.excludeDropFromAllTasks(item.getName()));
+		menu.add(excludeAll);
+		installPopup(row, menu);
+
 		return row;
+	}
+
+	private JPanel buildExcludedDropsControl(TaskView task)
+	{
+		final JButton manage = new JButton(task.getExcludedDrops().size() == 1
+			? "1 excluded drop"
+			: task.getExcludedDrops().size() + " excluded drops");
+		manage.setFont(FontManager.getRunescapeSmallFont());
+		manage.setForeground(Color.LIGHT_GRAY);
+		manage.setToolTipText("Choose an excluded drop to include again");
+		manage.setHorizontalAlignment(SwingConstants.LEFT);
+		SwingUtil.removeButtonDecorations(manage);
+		manage.addActionListener(e ->
+		{
+			final TaskView.ExcludedDrop selected = (TaskView.ExcludedDrop) JOptionPane.showInputDialog(
+				this, "Choose a drop to include again:", "Excluded drops",
+				JOptionPane.PLAIN_MESSAGE, null, task.getExcludedDrops().toArray(),
+				task.getExcludedDrops().get(0));
+			if (selected == null)
+			{
+				return;
+			}
+			if (selected.isGlobal())
+			{
+				plugin.includeDropForAllTasks(selected.getName());
+			}
+			else
+			{
+				plugin.includeDropForTask(task.getTaskName(), selected.getName());
+			}
+		});
+
+		final JPanel row = new JPanel(new BorderLayout());
+		row.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+		row.add(manage, BorderLayout.CENTER);
+		return row;
+	}
+
+	private static void installPopup(JComponent component, JPopupMenu menu)
+	{
+		component.setComponentPopupMenu(menu);
+		installPopupChildren(component);
+	}
+
+	private static void installPopupChildren(JComponent component)
+	{
+		for (Component child : component.getComponents())
+		{
+			if (child instanceof JComponent)
+			{
+				((JComponent) child).setInheritsPopupMenu(true);
+				installPopupChildren((JComponent) child);
+			}
+		}
 	}
 
 	/**
@@ -684,7 +761,9 @@ class SlayerTaskLootPanel extends PluginPanel
 		final JLabel nameLabel = new JLabel(left.toString());
 		nameLabel.setFont(FontManager.getRunescapeSmallFont());
 		nameLabel.setForeground(Color.GRAY);
-		panel.add(nameLabel, BorderLayout.WEST);
+		// CENTER is allowed to shrink when the sidebar is narrow. WEST would retain the
+		// label's full preferred width and make the entire scrollable card grow sideways.
+		panel.add(nameLabel, BorderLayout.CENTER);
 
 		final JLabel valueLabel = new JLabel(gp(supply.getValue()));
 		valueLabel.setFont(FontManager.getRunescapeSmallFont());
@@ -718,7 +797,7 @@ class SlayerTaskLootPanel extends PluginPanel
 		final JLabel leftLabel = new JLabel(left);
 		leftLabel.setFont(font);
 		leftLabel.setForeground(right == null ? color : Color.LIGHT_GRAY);
-		panel.add(leftLabel, BorderLayout.WEST);
+		panel.add(leftLabel, BorderLayout.CENTER);
 
 		if (right != null)
 		{
@@ -758,5 +837,44 @@ class SlayerTaskLootPanel extends PluginPanel
 		return hours > 0
 			? String.format("%d:%02d:%02d", hours, minutes, seconds)
 			: String.format("%d:%02d", minutes, seconds);
+	}
+
+	/** Keeps scroll contents at the sidebar width instead of following their widest label. */
+	private static final class ViewportWidthPanel extends JPanel implements Scrollable
+	{
+		private ViewportWidthPanel(LayoutManager layout)
+		{
+			super(layout);
+		}
+
+		@Override
+		public Dimension getPreferredScrollableViewportSize()
+		{
+			return getPreferredSize();
+		}
+
+		@Override
+		public int getScrollableUnitIncrement(Rectangle visibleRect, int orientation, int direction)
+		{
+			return 16;
+		}
+
+		@Override
+		public int getScrollableBlockIncrement(Rectangle visibleRect, int orientation, int direction)
+		{
+			return Math.max(16, visibleRect.height - 16);
+		}
+
+		@Override
+		public boolean getScrollableTracksViewportWidth()
+		{
+			return true;
+		}
+
+		@Override
+		public boolean getScrollableTracksViewportHeight()
+		{
+			return false;
+		}
 	}
 }

@@ -46,6 +46,22 @@ class TaskView
 	/** Sessions belonging to this assignment, in creation order. */
 	List<SessionView> sessionViews;
 
+	/** Exclusions affecting this task, managed from its Drops section. */
+	List<ExcludedDrop> excludedDrops;
+
+	@Value
+	static class ExcludedDrop
+	{
+		String name;
+		boolean global;
+
+		@Override
+		public String toString()
+		{
+			return name + (global ? " (all tasks)" : " (this task)");
+		}
+	}
+
 	@Value
 	static class LootRow
 	{

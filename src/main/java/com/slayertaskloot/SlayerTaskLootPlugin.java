@@ -104,7 +104,15 @@ public class SlayerTaskLootPlugin extends Plugin
 		InterfaceID.TRADEMAIN,
 		InterfaceID.GE_OFFERS,
 		InterfaceID.GE_COLLECT,
+		InterfaceID.DEATHKEEP,
+		InterfaceID.GRAVESTONE_RETRIEVAL,
+		InterfaceID.DEATH_OFFICE,
+		InterfaceID.DEATH_COFFER,
+		InterfaceID.DEATH_COFFER_SIDE,
+		InterfaceID.GRAVESTONE_GENERIC,
 	};
+	/** Death inventory changes can arrive several ticks after the local death event. */
+	private static final int DEATH_RESYNC_TICKS = 10;
 
 	/** Task id meaning "a boss", from [proc,helper_slayer_current_assignment]. */
 	private static final int BOSS_TASK_ID = 98;
@@ -372,6 +380,7 @@ public class SlayerTaskLootPlugin extends Plugin
 	/** Tick the counter reached zero, or -1. Keeps a finished task open for its late loot. */
 	private int taskEndTick = -1;
 	private boolean supplyResyncPending;
+	private int supplyResyncUntilTick = -1;
 	private boolean persistDirty;
 	private boolean panelDirty;
 	private int lastWeaponUsageTick = -1;
@@ -410,6 +419,12 @@ public class SlayerTaskLootPlugin extends Plugin
 	@Override
 	protected void startUp()
 	{
+		final String formattedExclusions = DropExclusions.formatPerTask(config.taskExcludedDrops());
+		if (!formattedExclusions.equals(config.taskExcludedDrops()))
+		{
+			configManager.setConfiguration(SlayerTaskLootConfig.GROUP, "taskExcludedDrops",
+				formattedExclusions);
+		}
 		panel = new SlayerTaskLootPanel(this, config, itemManager);
 		navButton = NavigationButton.builder()
 			.tooltip("Slayer Task Loot")
@@ -458,6 +473,7 @@ public class SlayerTaskLootPlugin extends Plugin
 		persistDirty = false;
 		panelDirty = false;
 		taskEndTick = -1;
+		supplyResyncUntilTick = -1;
 		confirmedTargets.clear();
 		recentDeaths.clear();
 		creditedNpcDeathTicks.clear();
@@ -938,6 +954,8 @@ public class SlayerTaskLootPlugin extends Plugin
 				for (ItemStack item : accepted.items)
 				{
 					final int itemId = itemManager.canonicalize(item.getId());
+					// Exclusions are presentation/accounting filters, not data-loss rules. Keep
+					// recording the drop so including it again restores the complete task total.
 					if (config.lootMode() == LootMode.DROPPED)
 					{
 						activeTask.addItem(sessionId, itemId, item.getQuantity(),
@@ -1408,6 +1426,7 @@ public class SlayerTaskLootPlugin extends Plugin
 		{
 			// Losing an inventory is not a supply cost.
 			supplyResyncPending = true;
+			supplyResyncUntilTick = client.getTickCount() + DEATH_RESYNC_TICKS;
 			return;
 		}
 
@@ -1944,7 +1963,7 @@ public class SlayerTaskLootPlugin extends Plugin
 	 */
 	private void processSupplies()
 	{
-		if (supplyResyncPending)
+		if (supplyResyncPending || client.getTickCount() <= supplyResyncUntilTick)
 		{
 			supplyResyncPending = false;
 			supplyTracker.resync();
@@ -2067,6 +2086,7 @@ public class SlayerTaskLootPlugin extends Plugin
 				final int matched = Math.min(gain.quantity, drop.quantity);
 				if (activeTask != null)
 				{
+					// Collected-mode exclusions are also retained invisibly for later inclusion.
 					activeTask.addItem(drop.sessionId, drop.itemId, matched,
 						(long) drop.unitPrice * matched);
 					markDirty();
@@ -2502,6 +2522,7 @@ public class SlayerTaskLootPlugin extends Plugin
 			specialEnergyLastSeen = -1;
 			// Tick-count anchors, so meaningless once the count restarts.
 			lastCannonballCount = -1;
+			supplyResyncUntilTick = -1;
 			supplyTracker.clear();
 			pendingLoot.clear();
 			recentDeaths.clear();
@@ -2912,6 +2933,16 @@ public class SlayerTaskLootPlugin extends Plugin
 				entry.getKey(), (long) itemManager.getItemPrice(entry.getKey()) * entry.getValue()));
 		}
 		Map<Integer, SupplyEntry> displayedSupplies = new LinkedHashMap<>(record.getSupplies());
+		for (Iterator<Map.Entry<Integer, Integer>> it = displayedItems.entrySet().iterator();
+			it.hasNext(); )
+		{
+			final Map.Entry<Integer, Integer> entry = it.next();
+			if (isDropExcluded(record.getTaskName(), entry.getKey()))
+			{
+				it.remove();
+				displayedItemValues.remove(entry.getKey());
+			}
+		}
 		for (Iterator<Map.Entry<Integer, SupplyEntry>> it =
 			displayedSupplies.entrySet().iterator(); it.hasNext(); )
 		{
@@ -2989,6 +3020,16 @@ public class SlayerTaskLootPlugin extends Plugin
 			sessionViews.add(new TaskView.SessionView(
 				session.getSessionId(), sessionNumber++, session.getOnTaskTicks(), session.isOpen()));
 		}
+		final List<TaskView.ExcludedDrop> excludedDrops = new ArrayList<>();
+		for (String item : DropExclusions.globalEntries(config.globalExcludedDrops()))
+		{
+			excludedDrops.add(new TaskView.ExcludedDrop(item, true));
+		}
+		for (String item : DropExclusions.entriesForTask(
+			config.taskExcludedDrops(), record.getTaskName()))
+		{
+			excludedDrops.add(new TaskView.ExcludedDrop(item, false));
+		}
 
 		return new TaskView(
 			record.getAssignmentId(),
@@ -3007,7 +3048,38 @@ public class SlayerTaskLootPlugin extends Plugin
 			record == activeTask && !sessionOpen && record.latestClosedSession() != null,
 			Collections.unmodifiableList(rows),
 			Collections.unmodifiableList(supplyRows),
-			Collections.unmodifiableList(sessionViews));
+			Collections.unmodifiableList(sessionViews),
+			Collections.unmodifiableList(excludedDrops));
+	}
+
+	private boolean isDropExcluded(String taskName, int itemId)
+	{
+		return DropExclusions.isExcluded(config.globalExcludedDrops(),
+			config.taskExcludedDrops(), taskName, itemName(itemId));
+	}
+
+	void excludeDropForTask(String taskName, String itemName)
+	{
+		configManager.setConfiguration(SlayerTaskLootConfig.GROUP, "taskExcludedDrops",
+			DropExclusions.addForTask(config.taskExcludedDrops(), taskName, itemName));
+	}
+
+	void excludeDropFromAllTasks(String itemName)
+	{
+		configManager.setConfiguration(SlayerTaskLootConfig.GROUP, "globalExcludedDrops",
+			DropExclusions.addGlobal(config.globalExcludedDrops(), itemName));
+	}
+
+	void includeDropForTask(String taskName, String itemName)
+	{
+		configManager.setConfiguration(SlayerTaskLootConfig.GROUP, "taskExcludedDrops",
+			DropExclusions.removeForTask(config.taskExcludedDrops(), taskName, itemName));
+	}
+
+	void includeDropForAllTasks(String itemName)
+	{
+		configManager.setConfiguration(SlayerTaskLootConfig.GROUP, "globalExcludedDrops",
+			DropExclusions.removeGlobal(config.globalExcludedDrops(), itemName));
 	}
 
 	private String itemName(int itemId)
