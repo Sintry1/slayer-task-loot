@@ -19,7 +19,7 @@ final class TaskNetting
 		final Map<Integer, SupplyEntry> netSupplies = new LinkedHashMap<>();
 		supplies.forEach((itemId, supply) -> netSupplies.put(itemId,
 			new SupplyEntry(supply.getQuantity(), supply.getValue(), supply.isDoseBased(),
-				supply.getComponents())));
+				supply.getComponentHundredths())));
 
 		for (Map.Entry<Integer, SupplyEntry> entry : netSupplies.entrySet())
 		{

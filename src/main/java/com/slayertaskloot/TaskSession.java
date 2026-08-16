@@ -104,11 +104,11 @@ class TaskSession
 			{
 				getSupplies().put(row.getItemId(),
 					new SupplyEntry(row.getQuantity(), row.getValue(), row.isDoseBased(),
-						row.getComponents()));
+						row.getComponentHundredths()));
 			}
 			else
 			{
-				existing.add(row.getQuantity(), row.getValue(), row.getComponents());
+				existing.add(row.getQuantity(), row.getValue(), row.getComponentHundredths());
 			}
 		}
 	}
@@ -171,11 +171,11 @@ class TaskSession
 			{
 				getSupplies().put(itemId,
 					new SupplyEntry(supply.getQuantity(), supply.getValue(), supply.isDoseBased(),
-						supply.getComponents()));
+						supply.getComponentHundredths()));
 			}
 			else
 			{
-				existing.add(supply.getQuantity(), supply.getValue(), supply.getComponents());
+				existing.add(supply.getQuantity(), supply.getValue(), supply.getComponentHundredths());
 			}
 		});
 	}

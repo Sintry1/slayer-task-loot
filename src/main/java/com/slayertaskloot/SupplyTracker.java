@@ -454,9 +454,23 @@ class SupplyTracker
 	 *
 	 * @param chargedItemId the item being used up, which the row is named after
 	 * @param extraValue    cost that isn't a whole component, such as a fraction of a vial
-	 * @param itemIdQuantityPairs component item ids and how many of each one use consumes
+	 * @param itemIdQuantityPairs component item ids and how many whole ones a use consumes
 	 */
 	SupplyCharge chargedItemUse(int chargedItemId, long extraValue, int... itemIdQuantityPairs)
+	{
+		return chargedItemUse(chargedItemId, extraValue, Collections.emptyMap(), itemIdQuantityPairs);
+	}
+
+	/**
+	 * As {@link #chargedItemUse(int, long, int...)}, for a use that also spends a <em>fraction</em>
+	 * of a component.
+	 *
+	 * @param fractionHundredths component ids to hundredths of an item, whose cost the caller has
+	 *                           already smoothed into {@code extraValue}. Listed in the breakdown
+	 *                           but not priced again here, so the row still sums to its total
+	 */
+	SupplyCharge chargedItemUse(int chargedItemId, long extraValue,
+		Map<Integer, Integer> fractionHundredths, int... itemIdQuantityPairs)
 	{
 		long total = extraValue;
 		final Map<Integer, Integer> components = new LinkedHashMap<>();
@@ -469,8 +483,15 @@ class SupplyTracker
 				continue;
 			}
 			total += (long) itemManager.getItemPrice(itemId) * quantity;
-			components.merge(itemId, quantity, Integer::sum);
+			components.merge(itemId, quantity * SupplyCharge.COMPONENT_SCALE, Integer::sum);
 		}
+		fractionHundredths.forEach((itemId, hundredths) ->
+		{
+			if (hundredths > 0)
+			{
+				components.merge(itemId, hundredths, Integer::sum);
+			}
+		});
 
 		if (chargedItemId <= 0)
 		{

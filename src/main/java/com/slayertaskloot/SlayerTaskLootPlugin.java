@@ -35,6 +35,7 @@ import net.runelite.api.ItemComposition;
 import net.runelite.api.MenuAction;
 import net.runelite.api.NPC;
 import net.runelite.api.NPCComposition;
+import net.runelite.api.Player;
 import net.runelite.api.Tile;
 import net.runelite.api.TileItem;
 import net.runelite.api.WorldView;
@@ -111,8 +112,21 @@ public class SlayerTaskLootPlugin extends Plugin
 		InterfaceID.DEATH_COFFER_SIDE,
 		InterfaceID.GRAVESTONE_GENERIC,
 	};
-	/** Death inventory changes can arrive several ticks after the local death event. */
-	private static final int DEATH_RESYNC_TICKS = 10;
+	/**
+	 * Ticks the supply baseline is held after a death, counted in ticks the supply loop
+	 * actually <em>processed</em> rather than in client tick numbers.
+	 *
+	 * <p>The distinction is the whole point. A respawn ends in a loading screen, and no
+	 * {@link GameTick} is delivered while one is up — but the client's tick counter keeps
+	 * climbing throughout. A deadline of {@code getTickCount() + n} therefore expired without
+	 * the loop ever running inside it, and the first tick after the loading screen diffed the
+	 * emptied containers against a baseline taken while the player was still holding everything.
+	 * That is the whole inventory billed as supplies, which is what a death lost to a gravestone
+	 * looked like in the panel.
+	 */
+	private static final int DEATH_SETTLE_TICKS = 15;
+	/** "You are dead" as the game says it — a second arm for the resync alongside ActorDeath. */
+	private static final String DEATH_MESSAGE = "Oh dear, you are dead!";
 
 	/** Task id meaning "a boss", from [proc,helper_slayer_current_assignment]. */
 	private static final int BOSS_TASK_ID = 98;
@@ -380,13 +394,13 @@ public class SlayerTaskLootPlugin extends Plugin
 	/** Tick the counter reached zero, or -1. Keeps a finished task open for its late loot. */
 	private int taskEndTick = -1;
 	private boolean supplyResyncPending;
-	private int supplyResyncUntilTick = -1;
+	/** Ticks of settling left after a death, or -1 when no death is being waited out. */
+	private int deathSettleTicks = -1;
 	private boolean persistDirty;
 	private boolean panelDirty;
 	private int lastWeaponUsageTick = -1;
 	private int lastWeaponUsageAnimation = -1;
 	private long scytheVialRemainder;
-	private int scytheAttacks;
 	private int loadedBlowpipeDartId = -1;
 	private int blowpipeDartRemainder;
 	private int blowpipeScaleRemainder;
@@ -474,7 +488,7 @@ public class SlayerTaskLootPlugin extends Plugin
 		persistDirty = false;
 		panelDirty = false;
 		taskEndTick = -1;
-		supplyResyncUntilTick = -1;
+		deathSettleTicks = -1;
 		confirmedTargets.clear();
 		recentDeaths.clear();
 		creditedNpcDeathTicks.clear();
@@ -1426,8 +1440,7 @@ public class SlayerTaskLootPlugin extends Plugin
 		if (event.getActor() == client.getLocalPlayer())
 		{
 			// Losing an inventory is not a supply cost.
-			supplyResyncPending = true;
-			supplyResyncUntilTick = client.getTickCount() + DEATH_RESYNC_TICKS;
+			noteLocalDeath();
 			return;
 		}
 
@@ -1465,25 +1478,17 @@ public class SlayerTaskLootPlugin extends Plugin
 		if (animation == 8056 && isScythe(weaponId))
 		{
 			// A hundred attacks to a vial. The vial is billed smoothly, ~1/100 of its price per
-			// swing, so the running cost tracks each attack instead of jumping every hundredth one.
+			// swing, so the running cost tracks each attack instead of jumping every hundredth one,
+			// and it is listed at the hundredth of a vial the swing actually spent. Listing it in
+			// whole vials instead meant it appeared in the breakdown only on every hundredth swing
+			// — so a task of forty scythe swings showed blood runes and no vial at all, and read as
+			// the vial not being tracked when its cost had been in the total all along.
 			final long vialNumerator = itemManager.getItemPrice(ItemID.VIAL_BLOOD) + scytheVialRemainder;
 			final long vialCost = vialNumerator / 100L;
 			scytheVialRemainder = vialNumerator % 100L;
 
-			if (++scytheAttacks >= 100)
-			{
-				// A whole vial has now been used, so surface it in the breakdown. Its full price is
-				// added as a component, so remove that from the smoothed cost to avoid double billing
-				// — this swing still only adds its ~1/100 share to the total.
-				scytheAttacks -= 100;
-				charge = supplyTracker.chargedItemUse(weaponId,
-					vialCost - itemManager.getItemPrice(ItemID.VIAL_BLOOD),
-					ItemID.BLOODRUNE, 2, ItemID.VIAL_BLOOD, 1);
-			}
-			else
-			{
-				charge = supplyTracker.chargedItemUse(weaponId, vialCost, ItemID.BLOODRUNE, 2);
-			}
+			charge = supplyTracker.chargedItemUse(weaponId, vialCost,
+				Collections.singletonMap(ItemID.VIAL_BLOOD, 1), ItemID.BLOODRUNE, 2);
 		}
 		else if (animation == 9493 && weaponId == ItemID.TUMEKENS_SHADOW)
 		{
@@ -1499,6 +1504,21 @@ public class SlayerTaskLootPlugin extends Plugin
 		}
 	}
 
+	/**
+	 * Holds the supply baseline across a death, however long the death sequence takes.
+	 *
+	 * <p>Armed from two independent signals — {@link ActorDeath} and the death chat message —
+	 * because a missed arm bills the entire lost inventory as supplies, and the two cost nothing
+	 * together. Both fire at the <em>start</em> of the sequence, several ticks before the
+	 * containers actually empty, which is why what they arm is a settling period rather than a
+	 * one-shot resync.
+	 */
+	private void noteLocalDeath()
+	{
+		supplyResyncPending = true;
+		deathSettleTicks = DEATH_SETTLE_TICKS;
+	}
+
 	@SuppressWarnings("unused")
 	@Subscribe
 	public void onChatMessage(ChatMessage event)
@@ -1510,6 +1530,12 @@ public class SlayerTaskLootPlugin extends Plugin
 		}
 
 		final String message = Text.removeTags(event.getMessage());
+		if (DEATH_MESSAGE.equals(message))
+		{
+			noteLocalDeath();
+			return;
+		}
+
 		// The magazine's size is a varp the supply diff reads directly; only the kind of
 		// ammunition in it has to be learned from a message.
 		if (config.cannonballType() == CannonballType.AUTOMATIC)
@@ -1978,7 +2004,24 @@ public class SlayerTaskLootPlugin extends Plugin
 	 */
 	private void processSupplies()
 	{
-		if (supplyResyncPending || client.getTickCount() <= supplyResyncUntilTick)
+		if (deathSettleTicks >= 0)
+		{
+			supplyResyncPending = false;
+			supplyTracker.resync();
+			// The countdown only runs while the player is alive again. Everything between the
+			// killing blow and the respawn — the death animation, the teleport, the loading
+			// screen that suppresses this loop entirely — is spent with the counter untouched,
+			// so the settling period is 15 ticks of a player standing in Lumbridge rather than
+			// 15 ticks of wall clock that the loop may never have seen.
+			final Player local = client.getLocalPlayer();
+			if (local != null && !local.isDead())
+			{
+				deathSettleTicks--;
+			}
+			return;
+		}
+
+		if (supplyResyncPending)
 		{
 			supplyResyncPending = false;
 			supplyTracker.resync();
@@ -2537,7 +2580,7 @@ public class SlayerTaskLootPlugin extends Plugin
 			specialEnergyLastSeen = -1;
 			// Tick-count anchors, so meaningless once the count restarts.
 			lastCannonballCount = -1;
-			supplyResyncUntilTick = -1;
+			deathSettleTicks = -1;
 			supplyTracker.clear();
 			pendingLoot.clear();
 			recentDeaths.clear();
@@ -3017,8 +3060,8 @@ public class SlayerTaskLootPlugin extends Plugin
 			}
 
 			final List<String> breakdown = new ArrayList<>();
-			supply.getComponents().forEach((componentId, quantity) -> breakdown.add(
-				itemName(componentId) + " x" + QuantityFormatter.quantityToStackSize(quantity)));
+			supply.getComponentHundredths().forEach((componentId, hundredths) -> breakdown.add(
+				itemName(componentId) + " x" + componentQuantity(hundredths)));
 
 			supplyRows.add(new TaskView.LootRow(
 				itemId, name, supply.getQuantity(), supply.getValue(),
@@ -3095,6 +3138,25 @@ public class SlayerTaskLootPlugin extends Plugin
 	{
 		configManager.setConfiguration(SlayerTaskLootConfig.GROUP, "globalExcludedDrops",
 			DropExclusions.removeGlobal(config.globalExcludedDrops(), itemName));
+	}
+
+	/**
+	 * Renders a component quantity held in hundredths of an item.
+	 *
+	 * <p>Whole quantities keep the abbreviated form the rest of the panel uses — "Blood rune x1.2K"
+	 * — since that is what a long task's rune count looks like. A part-used component drops to
+	 * plain decimals instead, because a fraction is small by definition and "x0.4" abbreviates to
+	 * nothing useful. Two decimals is what one scythe swing needs to be visible at all: "x0.01".
+	 */
+	static String componentQuantity(int hundredths)
+	{
+		if (hundredths % SupplyCharge.COMPONENT_SCALE == 0)
+		{
+			return QuantityFormatter.quantityToStackSize(hundredths / SupplyCharge.COMPONENT_SCALE);
+		}
+		return String.format(java.util.Locale.ROOT,
+			hundredths % 10 == 0 ? "%.1f" : "%.2f",
+			hundredths / (double) SupplyCharge.COMPONENT_SCALE);
 	}
 
 	private String itemName(int itemId)
