@@ -23,10 +23,22 @@ class SupplyEntry
 	private boolean doseBased;
 
 	/**
-	 * For a charged item, what its uses consumed as component itemId -> quantity. Null for an
-	 * ordinary supply, and null on records written before charges were grouped.
+	 * Legacy whole-item component quantities, from records written before a use could spend a
+	 * fraction of a component. Read and migrated, never written.
 	 */
 	private Map<Integer, Integer> components;
+
+	/**
+	 * For a charged item, what its uses consumed as component itemId -> <em>hundredths</em> of an
+	 * item. Null for an ordinary supply.
+	 *
+	 * <p>Hundredths because the quantity a single use spends is often a fraction: a scythe swing
+	 * costs one hundredth of a vial of blood. Held as whole items, that fraction was only
+	 * representable once a hundred swings had accumulated a whole one, so on any ordinary task the
+	 * vial never appeared in the breakdown at all — while its cost was in the row's total the
+	 * whole time. Tracked but invisible reads exactly like not tracked, and got reported as such.
+	 */
+	private Map<Integer, Integer> componentHundredths;
 
 	/** Gson. */
 	SupplyEntry()
@@ -38,23 +50,36 @@ class SupplyEntry
 		this(quantity, value, doseBased, null);
 	}
 
-	SupplyEntry(int quantity, long value, boolean doseBased, Map<Integer, Integer> components)
+	SupplyEntry(int quantity, long value, boolean doseBased,
+		Map<Integer, Integer> componentHundredths)
 	{
 		this.quantity = quantity;
 		this.value = value;
 		this.doseBased = doseBased;
-		this.components = components == null || components.isEmpty()
-			? null : new LinkedHashMap<>(components);
+		this.componentHundredths = componentHundredths == null || componentHundredths.isEmpty()
+			? null : new LinkedHashMap<>(componentHundredths);
 	}
 
-	Map<Integer, Integer> getComponents()
+	/** Components in hundredths of an item, migrating a legacy whole-item map on the way out. */
+	Map<Integer, Integer> getComponentHundredths()
 	{
-		return components == null ? Collections.emptyMap() : components;
+		if (componentHundredths != null)
+		{
+			return componentHundredths;
+		}
+		if (components == null || components.isEmpty())
+		{
+			return Collections.emptyMap();
+		}
+		final Map<Integer, Integer> migrated = new LinkedHashMap<>();
+		components.forEach((itemId, count) ->
+			migrated.put(itemId, count * SupplyCharge.COMPONENT_SCALE));
+		return migrated;
 	}
 
 	boolean isCharged()
 	{
-		return components != null && !components.isEmpty();
+		return !getComponentHundredths().isEmpty();
 	}
 
 	void add(int quantity, long value)
@@ -63,17 +88,21 @@ class SupplyEntry
 		this.value += value;
 	}
 
-	void add(int quantity, long value, Map<Integer, Integer> components)
+	void add(int quantity, long value, Map<Integer, Integer> componentHundredths)
 	{
 		add(quantity, value);
-		if (components == null || components.isEmpty())
+		if (componentHundredths == null || componentHundredths.isEmpty())
 		{
 			return;
 		}
-		if (this.components == null)
+		if (this.componentHundredths == null)
 		{
-			this.components = new LinkedHashMap<>();
+			// Fold any legacy map in first, so a record part-written under either scheme keeps
+			// the components it already had rather than restarting the count.
+			this.componentHundredths = new LinkedHashMap<>(getComponentHundredths());
+			this.components = null;
 		}
-		components.forEach((itemId, count) -> this.components.merge(itemId, count, Integer::sum));
+		componentHundredths.forEach(
+			(itemId, count) -> this.componentHundredths.merge(itemId, count, Integer::sum));
 	}
 }
