@@ -368,7 +368,16 @@ class SlayerTaskLootPanel extends PluginPanel
 		// counter is already down, and implying otherwise would just look broken.
 		final String killLine = task.getKills() + (task.getKills() == 1 ? " kill" : " kills")
 			+ " tracked · " + formatDuration(task.getOnTaskTicks());
-		box.add(row(killLine, null, Color.LIGHT_GRAY, FontManager.getRunescapeSmallFont()));
+		final JPanel killRow = row(killLine, null, Color.LIGHT_GRAY, FontManager.getRunescapeSmallFont());
+		if (task.getAttributedKills() < task.getKills())
+		{
+			// The count comes from the slayer counter; sessions only hold the kills that could be
+			// matched to a death the client saw. Surfaced rather than hidden, because the shortfall
+			// is exactly the set of kills whose drops may have landed on the wrong session.
+			killRow.setToolTipText(task.getAttributedKills() + " of "
+				+ task.getKills() + " matched to a session");
+		}
+		box.add(killRow);
 
 		// Sessions are shown so the supply attribution can be sanity-checked rather than
 		// taken on trust — "3 sessions, 47 min on task" is checkable against reality.

@@ -117,6 +117,81 @@ public class TaskSessionTest
 		assertEquals(5, task.getSupplies().get(565).getQuantity());
 	}
 
+	/**
+	 * The counter is the only exact kill signal, so a kill it banked has to survive the death
+	 * match failing. This is the 311-vs-253 case: every kill moved the counter, but a despawn
+	 * seen outside the two-tick window matched nothing and used to be discarded outright.
+	 */
+	@Test
+	public void countedKillsSurviveTheDeathMatchFailing()
+	{
+		final TaskLootRecord task = new TaskLootRecord("Gargoyles", null, 311, 1L);
+		final TaskSession session = task.openNewSession(10L, false);
+
+		for (int i = 0; i < 311; i++)
+		{
+			task.addCounterKills(1);
+		}
+		// Only some of those could be tied to a death the client saw in time.
+		task.addKills(session.getSessionId(), 253);
+
+		assertEquals(311, task.getKills());
+		assertEquals(253, task.getAttributedKills());
+	}
+
+	/** They count the same kills by different means, so the total is the larger, never the sum. */
+	@Test
+	public void countedAndAttributedKillsAreNotAddedTogether()
+	{
+		final TaskLootRecord task = new TaskLootRecord("Gargoyles", null, 100, 1L);
+		final TaskSession session = task.openNewSession(10L, false);
+		task.addCounterKills(40);
+		task.addKills(session.getSessionId(), 40);
+
+		assertEquals(40, task.getKills());
+	}
+
+	/**
+	 * A death can be credited with no counter movement to pair with — loot arriving for a kill
+	 * the counter banked earlier does exactly that — so the attributed side has to be able to lead.
+	 */
+	@Test
+	public void attributedKillsLeadWhenTheyExceedTheCounter()
+	{
+		final TaskLootRecord task = new TaskLootRecord("Gargoyles", null, 100, 1L);
+		final TaskSession session = task.openNewSession(10L, false);
+		task.addCounterKills(2);
+		task.addKills(session.getSessionId(), 5);
+
+		assertEquals(5, task.getKills());
+	}
+
+	/** Records stored before the counter total existed carry only the attributed side. */
+	@Test
+	public void storedRecordWithoutACounterTotalKeepsItsKills()
+	{
+		final TaskLootRecord task = new Gson().fromJson(
+			"{\"taskName\":\"Gargoyles\",\"kills\":47}", TaskLootRecord.class);
+
+		assertEquals(47, task.getKills());
+		assertEquals(47, task.getAttributedKills());
+	}
+
+	@Test
+	public void mergingRecordsPoolsCountedKills()
+	{
+		final TaskLootRecord active = new TaskLootRecord("Gargoyles", null, 100, 20L);
+		active.addCounterKills(30);
+
+		final TaskLootRecord historical = new TaskLootRecord("Gargoyles", null, 90, 1L);
+		historical.addCounterKills(12);
+		historical.setEndedAt(10L);
+
+		active.mergeRecord(historical);
+
+		assertEquals(42, active.getKills());
+	}
+
 	@Test
 	public void historicalRecordCanBePooledIntoActiveMatchingTask()
 	{

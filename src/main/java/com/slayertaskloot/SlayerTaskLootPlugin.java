@@ -840,10 +840,29 @@ public class SlayerTaskLootPlugin extends Plugin
 	// Kill credit and sessions
 	// ------------------------------------------------------------------
 
+	/**
+	 * Banks counter movement as kills, then tries to attribute it to deaths the client saw.
+	 *
+	 * <p>The order matters. The counter is exact — it moves once per kill toward the assignment
+	 * and for nothing else — so the kill is recorded first and unconditionally. Matching it to a
+	 * {@link RecentDeath} is a separate, best-effort question about <em>which session</em> the
+	 * kill and its drops belong to, and it is allowed to fail: an uncredited death token survives
+	 * only {@link #CREDIT_MATCH_TOLERANCE} ticks, so a despawn observed a few ticks either side of
+	 * the varp change finds nothing to pair with.
+	 *
+	 * <p>Previously the attribution decided both, and a failed match discarded the kill outright
+	 * with no retry and no reconciliation against the counter — a task the game reported as 311
+	 * kills showed 253.
+	 */
 	private void creditCounterMovement(int progress)
 	{
 		lastCreditTick = client.getTickCount();
 		log.debug("Slayer assignment progressed by {}", progress);
+		if (activeTask != null)
+		{
+			activeTask.addCounterKills(progress);
+			markDirty();
+		}
 		confirmRecentDeaths(lastCreditTick, progress);
 	}
 
@@ -3094,6 +3113,7 @@ public class SlayerTaskLootPlugin extends Plugin
 			record.getTaskName(),
 			record.getTaskLocation(),
 			record.getKills(),
+			record.getAttributedKills(),
 			record.getInitialAmount(),
 			record.getStartedAt(),
 			record.getEndedAt(),

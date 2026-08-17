@@ -32,8 +32,27 @@ class TaskLootRecord
 	/** Size of the assignment when it was handed out. */
 	private int initialAmount;
 
-	/** Kills credited by the slayer counter. Not the same as the number of drops seen. */
+	/**
+	 * Kills attributed to a specific death the client observed, and therefore to a session.
+	 * Not the task's kill count — see {@link #counterKills} for why it can fall short of it.
+	 */
 	private int kills;
+
+	/**
+	 * Kills counted straight off the slayer counter, which is the only exact signal available:
+	 * it moves once per kill that counted toward the assignment, and for nothing else.
+	 *
+	 * <p>Kept separately from {@link #kills} because the two answer different questions.
+	 * A kill is only added to {@code kills} once a scene-observed death has been matched to it
+	 * within a couple of ticks, which is what decides the <em>session</em> a kill and its drops
+	 * belong to. That match legitimately fails — a despawn seen outside the window, a death the
+	 * client never saw — and when it does the kill is unattributable but has still happened.
+	 * Counting it here means a failed match costs the drops' session attribution, not the kill.
+	 *
+	 * <p>Only movement actually observed is counted, so enabling the plugin midway through an
+	 * assignment credits the kills from that point rather than the whole counter.
+	 */
+	private int counterKills;
 
 	/** Epoch millis when this assignment was first seen. */
 	private long startedAt;
@@ -252,9 +271,30 @@ class TaskLootRecord
 			+ getTaskSessions().stream().mapToLong(TaskSession::getSupplyCost).sum();
 	}
 
+	/**
+	 * The task's kill count: whichever of the two counts is larger.
+	 *
+	 * <p>Not a sum — they measure the same kills by different means, so adding them would double
+	 * every kill that both saw. The counter is authoritative and normally wins. The attributed
+	 * side is taken when it leads for two reasons: records stored before {@code counterKills}
+	 * existed carry no counter total at all, and a death can be credited without counter movement
+	 * to match it, which is how loot for a kill the counter had already banked still lands.
+	 */
 	int getKills()
 	{
+		return Math.max(counterKills, getAttributedKills());
+	}
+
+	/** Kills tied to an observed death, and so to a session. Always {@code <=} {@link #getKills()}. */
+	int getAttributedKills()
+	{
 		return kills + getTaskSessions().stream().mapToInt(TaskSession::getKills).sum();
+	}
+
+	/** Records assignment-counter movement, which is one kill per unit by definition. */
+	void addCounterKills(int count)
+	{
+		counterKills += count;
 	}
 
 	TaskSession openNewSession(long now, boolean openedManually)
@@ -399,6 +439,7 @@ class TaskLootRecord
 		});
 
 		kills += other.kills;
+		counterKills += other.counterKills;
 		supplyCost += other.supplyCost;
 		sessions += other.sessions;
 		onTaskTicks += other.onTaskTicks;

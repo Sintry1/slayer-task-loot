@@ -21,6 +21,10 @@ class TaskView
 	String taskLocation;
 
 	int kills;
+
+	/** The subset of {@link #kills} that could be matched to an observed death, and so to a session. */
+	int attributedKills;
+
 	int initialAmount;
 	long startedAt;
 	long endedAt;
