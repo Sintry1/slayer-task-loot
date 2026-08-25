@@ -38,6 +38,11 @@ final class SlayerTaskTargets
 		aliases.put("crabs", Arrays.asList("Ammonite Crab", "Frost Crab", "King Sand Crab", "Rock Crab", "Giant Rock Crab", "Sand Crab", "Swamp Crab"));
 		aliases.put("crawling hands", Arrays.asList("Crushing hand"));
 		aliases.put("custodian stalkers", Arrays.asList("Ancient Custodian"));
+		// Assignable two ways, and only one of them needs help. A regular "Dagannoth" task already
+		// reaches the kings on the whole-word rule, since each is a Dagannoth by name. The boss
+		// assignment is handed out as "Dagannoth Kings", which shares no whole word with any of
+		// them — "kings" is not what they are called individually. Not in RuneLite's table either.
+		aliases.put("dagannoth kings", Arrays.asList("Dagannoth Rex", "Dagannoth Prime", "Dagannoth Supreme"));
 		aliases.put("dark beasts", Arrays.asList("Night beast"));
 		aliases.put("dark warriors", Arrays.asList("Dark warrior"));
 		aliases.put("dogs", Arrays.asList("Jackal", "Temple Guardian"));
@@ -108,6 +113,15 @@ final class SlayerTaskTargets
 		if (task.isEmpty() || npc.isEmpty())
 		{
 			return false;
+		}
+
+		// The name as assigned, before any singularising. Boss assignments are handed out under
+		// the boss's own name, and a boss whose name simply ends in an s — Sarachnis, Venenatis,
+		// Cerberus, Vardorvis — is not a plural. Stripping first left "sarachni", which matches
+		// the NPC called Sarachnis nowhere, so the assignment recognised none of its own kills.
+		if (wholeWordMatch(npc, task))
+		{
+			return true;
 		}
 
 		if (wholeWordMatch(npc, task.replaceAll("s$", "")))
