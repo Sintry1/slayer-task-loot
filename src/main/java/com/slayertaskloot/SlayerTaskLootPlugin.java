@@ -61,6 +61,7 @@ import net.runelite.api.gameval.InventoryID;
 import net.runelite.api.gameval.ItemID;
 import net.runelite.api.gameval.VarPlayerID;
 import net.runelite.api.gameval.VarbitID;
+import net.runelite.api.widgets.Widget;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
@@ -125,6 +126,17 @@ public class SlayerTaskLootPlugin extends Plugin
 	 * looked like in the panel.
 	 */
 	private static final int DEATH_SETTLE_TICKS = 15;
+	/**
+	 * Hard ceiling on the settling period, in ticks the supply loop processed, whatever the
+	 * player's state.
+	 *
+	 * <p>{@link #DEATH_SETTLE_TICKS} only counts down while the player reads as alive, which is
+	 * a condition that in principle may never arrive — and a hold that never ends is a supply
+	 * total silently stuck at zero for the rest of the session, the loudest-costing and
+	 * quietest-looking failure this plugin has. Generous enough never to cut a real death's
+	 * settling short at ~1 minute of ticks, so reaching it means something else is wrong.
+	 */
+	private static final int DEATH_SETTLE_MAX_TICKS = 100;
 	/** "You are dead" as the game says it — a second arm for the resync alongside ActorDeath. */
 	private static final String DEATH_MESSAGE = "Oh dear, you are dead!";
 
@@ -362,9 +374,6 @@ public class SlayerTaskLootPlugin extends Plugin
 	/** Supply charges made while no session was open, replayed if one opens within the grace window. */
 	private final Deque<BufferedCharge> graceBuffer = new ArrayDeque<>();
 
-	/** Groups currently open that make item movement something other than consumption. */
-	private final Set<Integer> openInterfaces = new HashSet<>();
-
 	// Memoised slayer DB resolution, keyed on the varps it derives from. See resolveTaskName().
 	private int cachedTaskId = -1;
 	private int cachedBossId = -1;
@@ -396,6 +405,8 @@ public class SlayerTaskLootPlugin extends Plugin
 	private boolean supplyResyncPending;
 	/** Ticks of settling left after a death, or -1 when no death is being waited out. */
 	private int deathSettleTicks = -1;
+	/** Ticks the current settling period may still be held for at most. See DEATH_SETTLE_MAX_TICKS. */
+	private int deathSettleTicksRemaining;
 	private boolean persistDirty;
 	private boolean panelDirty;
 	private int lastWeaponUsageTick = -1;
@@ -501,7 +512,6 @@ public class SlayerTaskLootPlugin extends Plugin
 		collectionInventorySnapshot = null;
 		collectionInventoryDirty = false;
 		clearGraceBuffer();
-		openInterfaces.clear();
 		quiverShotTick = -1;
 		specialEnergyLastSeen = -1;
 		lastCannonballCount = -1;
@@ -1536,6 +1546,7 @@ public class SlayerTaskLootPlugin extends Plugin
 	{
 		supplyResyncPending = true;
 		deathSettleTicks = DEATH_SETTLE_TICKS;
+		deathSettleTicksRemaining = DEATH_SETTLE_MAX_TICKS;
 	}
 
 	@SuppressWarnings("unused")
@@ -2037,6 +2048,14 @@ public class SlayerTaskLootPlugin extends Plugin
 			{
 				deathSettleTicks--;
 			}
+			if (--deathSettleTicksRemaining <= 0)
+			{
+				// The alive-again condition never arrived. Charging again from a fresh baseline
+				// is the safe way to be wrong here: at worst one death's aftermath goes unbilled,
+				// against a supply total stuck at zero indefinitely.
+				log.debug("Death settling hit its ceiling with the player still reading as dead");
+				deathSettleTicks = -1;
+			}
 			return;
 		}
 
@@ -2253,47 +2272,29 @@ public class SlayerTaskLootPlugin extends Plugin
 		alchemyCollectionIgnores.clear();
 	}
 
-	@SuppressWarnings("unused")
-	@Subscribe
-	public void onWidgetLoaded(WidgetLoaded event)
-	{
-		if (isResyncGroup(event.getGroupId()))
-		{
-			openInterfaces.add(event.getGroupId());
-		}
-	}
-
-	@SuppressWarnings("unused")
-	@Subscribe
-	public void onWidgetClosed(WidgetClosed event)
-	{
-		openInterfaces.remove(event.getGroupId());
-	}
-
-	private static boolean isResyncGroup(int groupId)
-	{
-		for (int candidate : RESYNC_INTERFACES)
-		{
-			if (candidate == groupId)
-			{
-				return true;
-			}
-		}
-		return false;
-	}
-
+	/**
+	 * Whether item movement right now is something other than consumption.
+	 *
+	 * <p>Asked of the client every time rather than remembered from {@link WidgetLoaded} /
+	 * {@link WidgetClosed}. Tracking it in a set made a missed close event permanent and total:
+	 * the group stayed in the set, {@link #processSupplies()} re-baselined on every tick instead
+	 * of charging, and supplies read as a flat 0 gp for the rest of the client's life — a task
+	 * over which 26 doses of potion were drunk showed "-0 gp" until RuneLite was restarted.
+	 * Nothing here has to be remembered, so nothing here can go stale.
+	 *
+	 * <p>The {@code isHidden} check is the point. A widget object outlives the interface that
+	 * built it, so a group the player opened once is non-null from then on — testing only for
+	 * null is what the closed bank of an hour ago looks like. This is the same open-test
+	 * RuneLite's own bank plugin uses.
+	 *
+	 * <p>Must run on the client thread, which both callers do.
+	 */
 	private boolean isResyncInterfaceOpen()
 	{
-		if (!openInterfaces.isEmpty())
-		{
-			return true;
-		}
-
-		// Fallback for the plugin being enabled while one of these is already open, in which
-		// case its WidgetLoaded came and went before we were listening.
 		for (int groupId : RESYNC_INTERFACES)
 		{
-			if (client.getWidget(groupId, 0) != null)
+			final Widget widget = client.getWidget(groupId, 0);
+			if (widget != null && !widget.isHidden())
 			{
 				return true;
 			}
@@ -2604,7 +2605,6 @@ public class SlayerTaskLootPlugin extends Plugin
 			pendingLoot.clear();
 			recentDeaths.clear();
 			creditedNpcDeathTicks.clear();
-			openInterfaces.clear();
 		}
 	}
 
