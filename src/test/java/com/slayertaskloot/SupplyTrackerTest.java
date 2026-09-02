@@ -3,6 +3,7 @@ package com.slayertaskloot;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 import java.util.HashMap;
@@ -35,6 +36,84 @@ public class SupplyTrackerTest
 		assertFalse(SupplyTracker.isLootOnlyName("Soda ash"));
 		assertFalse(SupplyTracker.isLootOnlyName("Shark"));
 		assertFalse(SupplyTracker.isLootOnlyName("Headless arrow"));
+		// Untradeable loot that is spent rather than bought. Billed, the removal posts a 0 gp row,
+		// netting cancels it against the drop, and both rows are deleted — which is how a polished
+		// tarnished spear left no trace of itself or of the rune spear it became.
+		assertTrue(SupplyTracker.isLootOnlyName("Tarnished spear"));
+		assertTrue(SupplyTracker.isLootOnlyName("Tarnished necklace"));
+		assertTrue(SupplyTracker.isLootOnlyName("Venator heart"));
+		// What it polishes into is an ordinary item and must still bill if it is ever used.
+		assertFalse(SupplyTracker.isLootOnlyName("Rune spear"));
+		assertFalse(SupplyTracker.isLootOnlyName("Venator bow"));
+	}
+
+	/**
+	 * The game is not consistent about the space before the dose, and the price lookup used to
+	 * rebuild the name as base + "(4)" — which matched "Prayer potion(4)" and missed
+	 * "Serum 207 (4)" and "Overload (4)", dropping those families out of dose netting entirely.
+	 */
+	@Test
+	public void doseBaseNameToleratesTheSpaceBeforeTheDose()
+	{
+		assertEquals("Prayer potion", SupplyTracker.doseBaseName("Prayer potion(4)"));
+		assertEquals("Serum 207", SupplyTracker.doseBaseName("Serum 207 (4)"));
+		assertEquals("Overload", SupplyTracker.doseBaseName("Overload (4)"));
+		assertEquals("Anti-venom+", SupplyTracker.doseBaseName("Anti-venom+(2)"));
+		assertEquals("Antidote++", SupplyTracker.doseBaseName("Antidote++(1)"));
+		assertNull(SupplyTracker.doseBaseName("Shark"));
+		assertNull(SupplyTracker.doseBaseName("(4)"));
+		// Charged jewellery carries a numeric suffix too, so this parses it like any other. The
+		// name is not what keeps a ring out of potion normalisation — the Drink action is.
+		assertEquals("Ring of dueling", SupplyTracker.doseBaseName("Ring of dueling(8)"));
+	}
+
+	@Test
+	public void bonesAndAshesAreSeparableFromEnsouledHeads()
+	{
+		// The bones/ashes toggle moves one of these two groups and not the other: remains can be
+		// spent for prayer experience, where an ensouled head is loot however the setting reads.
+		assertTrue(SupplyTracker.isPrayerRemainsName("Dragon bones"));
+		assertTrue(SupplyTracker.isPrayerRemainsName("Malicious ashes"));
+		assertFalse(SupplyTracker.isPrayerRemainsName("Ensouled abyssal head"));
+
+		assertTrue(SupplyTracker.isEnsouledHeadName("Ensouled abyssal head"));
+		assertFalse(SupplyTracker.isEnsouledHeadName("Dragon bones"));
+		assertFalse(SupplyTracker.isEnsouledHeadName("Shark"));
+	}
+
+	@Test
+	public void changingDenominationIsNotConsumption()
+	{
+		// A million coins out, a thousand platinum tokens in. Counted in items that is 999,000
+		// gone and the transformation guard can't see it, so the entire balance was billed as
+		// supplies — reported after converting a task's alching proceeds at the bank. Counted in
+		// gp, which is the only unit the two share, both sides are the same number.
+		assertEquals(0L,
+			SupplyTracker.familyUnits(ItemID.COINS, -1_000_000, 0, 1)
+				+ SupplyTracker.familyUnits(ItemID.PLATINUM, 1000, 0, 1000));
+
+		// And the other way round, which is the same exchange run backwards.
+		assertEquals(0L,
+			SupplyTracker.familyUnits(ItemID.PLATINUM, -1000, 0, 1000)
+				+ SupplyTracker.familyUnits(ItemID.COINS, 1_000_000, 0, 1));
+	}
+
+	@Test
+	public void coinsGenuinelySpentStillCountAtFaceValue()
+	{
+		// The fix must not make coins free: only a matched exchange cancels.
+		assertEquals(-500L, SupplyTracker.familyUnits(ItemID.COINS, -500, 0, 1));
+		assertTrue(SupplyTracker.isCurrency(ItemID.COINS));
+		assertTrue(SupplyTracker.isCurrency(ItemID.PLATINUM));
+		assertFalse(SupplyTracker.isCurrency(ItemID.SHARK));
+	}
+
+	@Test
+	public void ordinaryItemsAndDosesKeepTheirOwnUnits()
+	{
+		assertEquals(-2L, SupplyTracker.familyUnits(ItemID.SHARK, -2, 0, 900));
+		// One 4-dose container leaving is four doses, whatever it is priced at.
+		assertEquals(-4L, SupplyTracker.familyUnits(ItemID._4DOSEPRAYERRESTORE, -1, 4, 10_000));
 	}
 
 	@Test

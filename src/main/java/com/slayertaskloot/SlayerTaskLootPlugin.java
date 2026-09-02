@@ -50,6 +50,7 @@ import net.runelite.api.events.ItemContainerChanged;
 import net.runelite.api.events.ItemDespawned;
 import net.runelite.api.events.MenuOptionClicked;
 import net.runelite.api.events.NpcDespawned;
+import net.runelite.api.events.StatChanged;
 import net.runelite.api.events.VarbitChanged;
 import net.runelite.api.events.WidgetClosed;
 import net.runelite.api.events.WidgetLoaded;
@@ -113,6 +114,22 @@ public class SlayerTaskLootPlugin extends Plugin
 		InterfaceID.DEATH_COFFER_SIDE,
 		InterfaceID.GRAVESTONE_GENERIC,
 	};
+	/**
+	 * Ticks a credited bone or ash drop is watched for before deciding it never reached the player.
+	 * Long enough for the container update to land, short enough that the prayer experience it is
+	 * matched against still belongs to the same kill.
+	 */
+	private static final int REMAINS_SETTLE_TICKS = 3;
+
+	/** Ticks an observed arrival of bones or ashes is remembered for. See {@link #remainsGains}. */
+	private static final int REMAINS_GAIN_MEMORY_TICKS = 8;
+	/**
+	 * How long a polish waits for its result. The item leaves and the reward arrives on the same
+	 * tick or the next; the window is wider than that so a slow container update can't lose a
+	 * reward, and narrow enough that an unrelated pickup minutes later can't be read as one.
+	 */
+	private static final int POLISH_RESULT_TICKS = 4;
+
 	/**
 	 * Ticks the supply baseline is held after a death, counted in ticks the supply loop
 	 * actually <em>processed</em> rather than in client tick numbers.
@@ -374,6 +391,38 @@ public class SlayerTaskLootPlugin extends Plugin
 	/** Supply charges made while no session was open, replayed if one opens within the grace window. */
 	private final Deque<BufferedCharge> graceBuffer = new ArrayDeque<>();
 
+	/**
+	 * Bones and ashes credited as drops, held while it is established whether they reached the
+	 * player. Only populated when bones and ashes are being counted as supplies.
+	 */
+	private final Deque<PendingRemains> pendingRemains = new ArrayDeque<>();
+
+	/**
+	 * Bones and ashes recently seen arriving in the carried snapshot.
+	 *
+	 * <p>Remembered rather than read off the current tick, because the two events are not on the
+	 * same one: the remains land in the inventory as the monster dies, and the drop that has to be
+	 * matched against them is only credited {@code CREDIT_MATCH_TOLERANCE} ticks later, once its
+	 * kill has had time to be attributed. Asking "did this arrive?" at that point is asking two
+	 * ticks too late, and would read every bone picked up as one a bonecrusher had eaten.
+	 */
+	private final Deque<RemainsGain> remainsGains = new ArrayDeque<>();
+
+	/** Last tick the player gained prayer experience, or -1. See {@link #resolvePendingRemains}. */
+	private int lastPrayerXpTick = -1;
+
+	/** Tarnished items polished this tick or the last few, waiting for the result to arrive. */
+	private final Deque<PendingPolish> pendingPolishes = new ArrayDeque<>();
+
+	/**
+	 * How many of each tarnished item this task has already had credited through a polish, so a
+	 * bank full of them polished mid-task can't credit the task with more than it dropped.
+	 */
+	private final Map<Integer, Integer> polishCredits = new HashMap<>();
+
+	/** Last prayer experience seen, so the first reading of a login isn't read as a gain. */
+	private int lastPrayerXp = -1;
+
 	// Memoised slayer DB resolution, keyed on the varps it derives from. See resolveTaskName().
 	private int cachedTaskId = -1;
 	private int cachedBossId = -1;
@@ -496,6 +545,8 @@ public class SlayerTaskLootPlugin extends Plugin
 		sessionOpen = false;
 		activeSessionId = null;
 		lastCreditSessionId = null;
+		pendingPolishes.clear();
+		polishCredits.clear();
 		persistDirty = false;
 		panelDirty = false;
 		taskEndTick = -1;
@@ -511,6 +562,10 @@ public class SlayerTaskLootPlugin extends Plugin
 		alchemyCollectionIgnores.clear();
 		collectionInventorySnapshot = null;
 		collectionInventoryDirty = false;
+		pendingRemains.clear();
+		remainsGains.clear();
+		lastPrayerXpTick = -1;
+		lastPrayerXp = -1;
 		clearGraceBuffer();
 		quiverShotTick = -1;
 		specialEnergyLastSeen = -1;
@@ -778,6 +833,8 @@ public class SlayerTaskLootPlugin extends Plugin
 		archiveActiveTask();
 
 		activeTask = new TaskLootRecord(taskName, taskLocation, initialAmount, System.currentTimeMillis());
+		pendingPolishes.clear();
+		polishCredits.clear();
 		sessionOpen = false;
 		activeSessionId = null;
 		lastCreditSessionId = null;
@@ -791,6 +848,8 @@ public class SlayerTaskLootPlugin extends Plugin
 		pendingPickups.clear();
 		pickupInventoryIgnores.clear();
 		alchemyCollectionIgnores.clear();
+		pendingRemains.clear();
+		remainsGains.clear();
 		resyncCollectionInventory();
 		lastCreditTick = -1;
 		taskEndTick = -1;
@@ -1004,6 +1063,14 @@ public class SlayerTaskLootPlugin extends Plugin
 					{
 						activeTask.addItem(sessionId, itemId, item.getQuantity(),
 							(long) itemManager.getItemPrice(itemId) * item.getQuantity());
+						// Only Dropped mode needs this. Collected counts what reaches the player,
+						// and remains a bonecrusher ate never do, so there is nothing to net there.
+						if (config.trackSupplies() && supplyTracker.isChargingPrayerRemains()
+							&& supplyTracker.isPrayerRemains(itemId))
+						{
+							pendingRemains.add(new PendingRemains(
+								accepted.tick, itemId, item.getQuantity()));
+						}
 					}
 					else
 					{
@@ -1326,22 +1393,19 @@ public class SlayerTaskLootPlugin extends Plugin
 			supplyResyncPending = true;
 		}
 
+		if ("Polish".equalsIgnoreCase(option))
+		{
+			final int polished = menuItemId(event);
+			if (polished > 0 && SupplyTracker.isSpentLootName(itemName(polished)))
+			{
+				pendingPolishes.add(
+					new PendingPolish(client.getTickCount(), itemManager.canonicalize(polished)));
+			}
+		}
+
 		if (isAlchemyCast(option, target))
 		{
-			int itemId = event.getItemId();
-			if (itemId <= 0 && event.getWidget() != null)
-			{
-				itemId = event.getWidget().getItemId();
-			}
-			if (itemId <= 0)
-			{
-				final net.runelite.api.ItemContainer inventory =
-					client.getItemContainer(InventoryID.INV);
-				final net.runelite.api.Item item = inventory == null
-					? null
-					: inventory.getItem(event.getParam0());
-				itemId = item == null ? -1 : item.getId();
-			}
+			final int itemId = menuItemId(event);
 			if (itemId > 0)
 			{
 				supplyTracker.ignoreRemoval(itemId, 1);
@@ -1367,10 +1431,16 @@ public class SlayerTaskLootPlugin extends Plugin
 				: inventory.getItem(event.getParam0());
 			if (item != null && item.getId() > 0 && item.getQuantity() > 0)
 			{
-				// Drop removes the whole selected stack; bury/scatter consumes one item per
-				// click, but neither is a task supply cost that should net against its loot.
-				final int ignored = "Drop".equalsIgnoreCase(option) ? item.getQuantity() : 1;
-				supplyTracker.ignoreRemoval(item.getId(), ignored);
+				// Drop removes the whole selected stack; bury/scatter consumes one item per click.
+				final boolean dropped = "Drop".equalsIgnoreCase(option);
+				// Burying is a real use of the item once the player has asked for it to be counted
+				// as one. Forgiving the removal here would leave the charge unbuilt and nothing for
+				// netting to cancel the drop against, so the setting would appear to do nothing.
+				if (dropped || !supplyTracker.isChargingPrayerRemains()
+					|| !supplyTracker.isPrayerRemains(item.getId()))
+				{
+					supplyTracker.ignoreRemoval(item.getId(), dropped ? item.getQuantity() : 1);
+				}
 			}
 		}
 	}
@@ -1617,6 +1687,7 @@ public class SlayerTaskLootPlugin extends Plugin
 	 */
 	private void applyChargeConfig()
 	{
+		supplyTracker.setChargePrayerRemains(config.netBonesAndAshes());
 		if (config.eyeOfAyakCharge() != EyeOfAyakCharge.AUTOMATIC)
 		{
 			supplyTracker.setEyeUsesTears(config.eyeOfAyakCharge() == EyeOfAyakCharge.DEMON_TEARS);
@@ -2082,6 +2153,219 @@ public class SlayerTaskLootPlugin extends Plugin
 		}
 
 		recordSupplyCharge(supplyTracker.charge());
+		recordRemainsGains();
+		resolvePendingRemains();
+		resolvePendingPolishes();
+	}
+
+	/** The inventory item a menu click acted on, however the entry happens to carry it. */
+	private int menuItemId(MenuOptionClicked event)
+	{
+		int itemId = event.getItemId();
+		if (itemId <= 0 && event.getWidget() != null)
+		{
+			itemId = event.getWidget().getItemId();
+		}
+		if (itemId <= 0)
+		{
+			final net.runelite.api.ItemContainer inventory =
+				client.getItemContainer(InventoryID.INV);
+			final net.runelite.api.Item item = inventory == null
+				? null
+				: inventory.getItem(event.getParam0());
+			itemId = item == null ? -1 : item.getId();
+		}
+		return itemId;
+	}
+
+	/**
+	 * Credits what a polished tarnished item turned into.
+	 *
+	 * <p>A tarnished item is worth nothing in itself — untradeable, and priced at zero — and its
+	 * entire value is the thing it becomes. Without this a polish contributes nothing at all: the
+	 * drop is recorded at 0 gp, and the reward arrives as an inventory <em>gain</em>, which the
+	 * supply diff skips as income and which the loot path never sees, because loot is only ever
+	 * recorded from an NPC drop event. A tarnished spear polished into a rune spear left no trace
+	 * in either column.
+	 *
+	 * <p>Both rows are kept: the tarnished drop stays at 0 gp as the record of what the venator
+	 * actually dropped, and the reward is credited beside it at its own price. Replacing the one
+	 * with the other reads more tidily and was rejected — the exclusion list works on item names,
+	 * so a drop that silently becomes a different item can't be excluded by the name it dropped
+	 * under. Nothing is counted twice either way, the tarnished side being zero.
+	 *
+	 * <p>Credited only against a tarnished item this task actually dropped, and once each. A bank
+	 * of them polished mid-task is otherwise indistinguishable from the one that just dropped, and
+	 * would credit the task with rewards earned on tasks long since archived.
+	 */
+	private void resolvePendingPolishes()
+	{
+		final int now = client.getTickCount();
+		while (!pendingPolishes.isEmpty()
+			&& now - pendingPolishes.peekFirst().tick > POLISH_RESULT_TICKS)
+		{
+			pendingPolishes.removeFirst();
+		}
+		if (pendingPolishes.isEmpty() || activeTask == null)
+		{
+			return;
+		}
+
+		// The reward is one item, and it is not itself tarnished. Anything else arriving on the
+		// same tick makes the pairing a guess, and a wrong guess credits the task with a drop it
+		// never had — so an ambiguous tick is left alone and the next one is tried instead.
+		int resultId = -1;
+		for (Map.Entry<Integer, Integer> gain : supplyTracker.gainsThisTick().entrySet())
+		{
+			if (SupplyTracker.isSpentLootName(itemName(gain.getKey())))
+			{
+				continue;
+			}
+			if (resultId > 0 || gain.getValue() != 1)
+			{
+				return;
+			}
+			resultId = gain.getKey();
+		}
+		if (resultId <= 0)
+		{
+			return;
+		}
+
+		final PendingPolish polish = pendingPolishes.removeFirst();
+		final int dropped = activeTask.getItems().getOrDefault(polish.itemId, 0);
+		if (dropped <= polishCredits.getOrDefault(polish.itemId, 0))
+		{
+			log.debug("Polished {} was not a drop of this task; {} not credited",
+				itemName(polish.itemId), itemName(resultId));
+			return;
+		}
+
+		polishCredits.merge(polish.itemId, 1, Integer::sum);
+		activeTask.addItem(sessionOpen ? activeSessionId : lastCreditSessionId, resultId, 1,
+			itemManager.getItemPrice(resultId));
+		markDirty();
+		log.debug("Credited {} from a polished {}", itemName(resultId), itemName(polish.itemId));
+	}
+
+	/** Files away any bones or ashes this tick's diff saw arrive, and forgets stale ones. */
+	private void recordRemainsGains()
+	{
+		if (!supplyTracker.isChargingPrayerRemains())
+		{
+			remainsGains.clear();
+			return;
+		}
+
+		final int now = client.getTickCount();
+		supplyTracker.gainsThisTick().forEach((itemId, quantity) ->
+		{
+			if (supplyTracker.isPrayerRemains(itemId))
+			{
+				remainsGains.add(new RemainsGain(now, itemId, quantity));
+			}
+		});
+		while (!remainsGains.isEmpty()
+			&& now - remainsGains.peekFirst().tick > REMAINS_GAIN_MEMORY_TICKS)
+		{
+			remainsGains.removeFirst();
+		}
+	}
+
+	/**
+	 * Bills bones and ashes a bonecrusher or ash sanctifier consumed before they ever reached the
+	 * player, so that netting can cancel them against the drop they arrived as.
+	 *
+	 * <p>Every other way of using them up — burying or scattering by hand, an offering spell — takes
+	 * the item out of the inventory, so the carried diff sees it and charges it like any other
+	 * supply. These two don't: the remains are consumed where they fell and no container ever holds
+	 * them, which leaves the drop counted as profit with nothing on the other side of the ledger.
+	 *
+	 * <p>Two conditions, and both are needed. <b>The remains never arrived</b> — anything that did
+	 * reach the inventory is the diff's to charge if and when it is buried, and billing it from the
+	 * drop as well would count it twice. <b>Prayer experience was granted</b> in the window — which
+	 * is what separates remains that were consumed from remains simply left on the floor, the one
+	 * distinction nothing else in the client makes. Neither alone is sufficient, so a bone buried by
+	 * hand on the same tick as another drops still bills exactly once.
+	 */
+	private void resolvePendingRemains()
+	{
+		if (pendingRemains.isEmpty())
+		{
+			return;
+		}
+		if (!supplyTracker.isChargingPrayerRemains())
+		{
+			// Switched off underneath entries already waiting. They were never a cost.
+			pendingRemains.clear();
+			return;
+		}
+
+		final int now = client.getTickCount();
+		for (Iterator<PendingRemains> it = pendingRemains.iterator(); it.hasNext(); )
+		{
+			final PendingRemains remains = it.next();
+			claimRemainsGains(remains, now);
+			if (remains.unaccounted <= 0)
+			{
+				it.remove();
+				continue;
+			}
+			if (now - remains.tick < REMAINS_SETTLE_TICKS)
+			{
+				continue;
+			}
+
+			it.remove();
+			// The experience may land a tick before the drop is reported, so the window opens one
+			// tick early rather than exactly on it.
+			if (lastPrayerXpTick >= remains.tick - 1 && lastPrayerXpTick <= now)
+			{
+				recordSupplyCharge(supplyTracker.consumedItem(remains.itemId, remains.unaccounted));
+			}
+		}
+	}
+
+	/**
+	 * Writes off as much of a drop as was seen arriving, one arrival to one drop.
+	 *
+	 * <p>Quantities are consumed on both sides so two kills' worth of bones can't both be excused
+	 * by one pickup, and a drop only part collected still bills the part that wasn't.
+	 */
+	private void claimRemainsGains(PendingRemains remains, int now)
+	{
+		for (RemainsGain gain : remainsGains)
+		{
+			if (remains.unaccounted <= 0)
+			{
+				return;
+			}
+			if (gain.itemId != remains.itemId || gain.quantity <= 0
+				|| gain.tick < remains.tick - 1 || gain.tick > now)
+			{
+				continue;
+			}
+
+			final int matched = Math.min(remains.unaccounted, gain.quantity);
+			gain.quantity -= matched;
+			remains.unaccounted -= matched;
+		}
+	}
+
+	@SuppressWarnings("unused")
+	@Subscribe
+	public void onStatChanged(StatChanged event)
+	{
+		if (event.getSkill() != Skill.PRAYER)
+		{
+			return;
+		}
+		// The first reading of a login is the total, not a gain.
+		if (lastPrayerXp >= 0 && event.getXp() > lastPrayerXp)
+		{
+			lastPrayerXpTick = client.getTickCount();
+		}
+		lastPrayerXp = event.getXp();
 	}
 
 	private void recordSupplyCharge(SupplyCharge charge)
@@ -3038,7 +3322,7 @@ public class SlayerTaskLootPlugin extends Plugin
 			final long grossBreakdown = displayedSupplies.values().stream()
 				.mapToLong(SupplyEntry::getValue).sum();
 			final TaskNetting.Result net = TaskNetting.apply(
-				displayedItems, displayedItemValues, displayedSupplies);
+				displayedItems, displayedItemValues, displayedSupplies, this::itemName);
 			displayedItems = net.getLootQuantities();
 			displayedItemValues = net.getLootValues();
 			displayedSupplies = net.getSupplies();
@@ -3250,6 +3534,50 @@ public class SlayerTaskLootPlugin extends Plugin
 		{
 			this.tick = tick;
 			this.charge = charge;
+		}
+	}
+
+	/** Bones or ashes from one credited drop, waiting to be seen arriving in the inventory. */
+	/** A tarnished item the player asked to polish, waiting for the reward to arrive. */
+	private static final class PendingPolish
+	{
+		private final int tick;
+		private final int itemId;
+
+		private PendingPolish(int tick, int itemId)
+		{
+			this.tick = tick;
+			this.itemId = itemId;
+		}
+	}
+
+	private static final class PendingRemains
+	{
+		private final int tick;
+		private final int itemId;
+		/** How much of the drop has still not been seen reaching the player. */
+		private int unaccounted;
+
+		private PendingRemains(int tick, int itemId, int quantity)
+		{
+			this.tick = tick;
+			this.itemId = itemId;
+			this.unaccounted = quantity;
+		}
+	}
+
+	/** Bones or ashes seen arriving, with however much of the arrival is still unclaimed. */
+	private static final class RemainsGain
+	{
+		private final int tick;
+		private final int itemId;
+		private int quantity;
+
+		private RemainsGain(int tick, int itemId, int quantity)
+		{
+			this.tick = tick;
+			this.itemId = itemId;
+			this.quantity = quantity;
 		}
 	}
 

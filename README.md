@@ -36,7 +36,9 @@ Charged weapons appear as a single row named after the weapon. Hover it to see w
 
 Things that aren't consumption don't get charged: banking, shops, trades, the Grand Exchange, dying, dropping an item, or setting up and picking up a cannon.
 
-By default, drops and supplies of the same item cancel out — five sharks dropped and two eaten shows three sharks and no shark cost. Turn off **Net matching drops** to see both.
+By default, drops and supplies of the same item cancel out — five sharks dropped and two eaten shows three sharks and no shark cost. Turn off **Net matching drops** to see both. Potions cancel too, in doses. A `Prayer potion(3)` dropped and two doses drunk shows a `Prayer potion(1)` in Drops and no prayer potion cost — the container you're actually left holding. Drops and doses are pooled per potion, so the remainder is repacked into the largest containers that hold it; five doses left over read as a `(4)` and a `(1)`.
+
+Bones and ashes are drops rather than supplies by default, since prayer experience is the point of them. Turn on **Count bones and ashes used** and any you bury, scatter or offer are counted as spent, so netting cancels them against the drop they came from — including the ones a bonecrusher or ash sanctifier takes before you ever see them.
 
 Supplies only count while a session is open. A session starts on your first credited kill, stays open while kills keep happening, and closes after an idle timeout — so an unrelated boss trip doesn't land on your task's bill. There's a grace window before the first kill so your teleport out and pre-fight boosts still count. You can also start, end, resume and merge sessions from the panel manually.
 
@@ -98,6 +100,7 @@ Implemented but not yet confirmed in game: trident of the swamp, enchanted tride
 |---|---|---|
 | Track supplies and profit | On | Off makes this a pure drop tracker |
 | Net matching drops | On | Cancel drops against supplies of the same item |
+| Count bones and ashes used | Off | Count bones and ashes you bury, scatter or offer as supplies, so netting cancels them against their drop |
 | End session after | 10 min | Idle time before supplies stop counting toward the task (1–60) |
 | Grace window | 30s | How long before your first kill supplies still count (0–300) |
 

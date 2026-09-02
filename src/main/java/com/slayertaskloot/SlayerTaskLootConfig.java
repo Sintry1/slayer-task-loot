@@ -183,13 +183,30 @@ public interface SlayerTaskLootConfig extends Config
 	}
 
 	@ConfigItem(
+		keyName = "netBonesAndAshes",
+		name = "Count bones and ashes used",
+		description = TOOLTIP_OPEN
+			+ "Count bones and ashes you buried, scattered or offered as supplies, so net matching "
+			+ "cancels them against the drop they came from. Covers a bonecrusher and ash "
+			+ "sanctifier as well as burying by hand. Off by default: prayer experience is the "
+			+ "point of them, so counting them as spent is a choice."
+			+ TOOLTIP_CLOSE,
+		section = suppliesSection,
+		position = 2
+	)
+	default boolean netBonesAndAshes()
+	{
+		return false;
+	}
+
+	@ConfigItem(
 		keyName = "sessionTimeout",
 		name = "End session after (minutes)",
 		description = TOOLTIP_OPEN
 			+ "How long without a task kill before supplies stop counting toward the task."
 			+ TOOLTIP_CLOSE,
 		section = suppliesSection,
-		position = 2
+		position = 3
 	)
 	@Range(min = 1, max = 60)
 	default int sessionTimeout()
@@ -205,7 +222,7 @@ public interface SlayerTaskLootConfig extends Config
 			+ "included. 0 counts from the first kill onward."
 			+ TOOLTIP_CLOSE,
 		section = suppliesSection,
-		position = 3
+		position = 4
 	)
 	@Range(min = 0, max = 300)
 	default int graceWindow()

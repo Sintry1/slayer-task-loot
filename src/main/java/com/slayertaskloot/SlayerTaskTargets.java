@@ -30,6 +30,10 @@ final class SlayerTaskTargets
 		aliases.put("black demons", Arrays.asList("Demonic gorilla", "Balfrug Kreeyath", "Skotizo", "Porazdir"));
 		aliases.put("black knights", Arrays.asList("Black Knight"));
 		aliases.put("blue dragons", Arrays.asList("Vorkath"));
+		// The three wilderness bosses each have a singles-plus variant that counts for the same
+		// assignment, and the assignment is only ever handed out under the main boss's name. The
+		// variants share no whole word with it, so only an alias can connect the two.
+		aliases.put("callisto", Arrays.asList("Artio"));
 		aliases.put("cave crawlers", Arrays.asList("Chasm crawler"));
 		aliases.put("cave horrors", Arrays.asList("Cave abomination"));
 		aliases.put("cave kraken", Arrays.asList("Kraken"));
@@ -88,7 +92,13 @@ final class SlayerTaskTargets
 		aliases.put("spiritual creatures", Arrays.asList("Spiritual ranger", "Spiritual mage", "Spiritual warrior"));
 		aliases.put("trolls", Arrays.asList("Dad", "Arrg", "Stick", "Kraka", "Pee Hat", "Rock", "Twig", "Berry"));
 		aliases.put("tzhaar", Arrays.asList("TzTok-Jad", "TzKal-Zuk"));
-		aliases.put("vampyres", Arrays.asList("Vyrewatch"));
+		// A venator counts for a vampyres assignment as well as for its own, and shares no whole
+		// word with either "vampyres" or "vampyre". The superior, "Blood-starved venator", needs
+		// nothing further — the alias is a whole word of it. The dedicated "Venators" assignment
+		// reaches both on the singular strip and needs no key of its own.
+		aliases.put("vampyres", Arrays.asList("Vyrewatch", "Venator"));
+		aliases.put("venenatis", Arrays.asList("Spindel"));
+		aliases.put("vet'ion", Arrays.asList("Calvar'ion"));
 		aliases.put("warped creatures", Arrays.asList("Warped terrorbird", "Warped tortoise", "Mutated terrorbird", "Mutated tortoise"));
 		aliases.put("werewolves", Arrays.asList("Werewolf"));
 		aliases.put("wolves", Arrays.asList("Wolf"));
@@ -108,8 +118,8 @@ final class SlayerTaskTargets
 			return false;
 		}
 
-		final String task = taskName.trim().toLowerCase(Locale.ROOT);
-		final String npc = npcName.replace('\u00A0', ' ').trim().toLowerCase(Locale.ROOT);
+		final String task = normalise(taskName);
+		final String npc = normalise(npcName);
 		if (task.isEmpty() || npc.isEmpty())
 		{
 			return false;
@@ -137,6 +147,20 @@ final class SlayerTaskTargets
 			}
 		}
 		return false;
+	}
+
+	/**
+	 * Folds the two characters the game spells inconsistently onto the plain ASCII the tables are
+	 * written in: a non-breaking space, and the typographic apostrophe that would otherwise make
+	 * Vet'ion and Calvar'ion miss their alias key.
+	 */
+	private static String normalise(String name)
+	{
+		return name
+			.replace('\u00A0', ' ')
+			.replace('\u2019', '\'')
+			.trim()
+			.toLowerCase(Locale.ROOT);
 	}
 
 	private static boolean wholeWordMatch(String haystack, String needle)
