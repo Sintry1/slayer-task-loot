@@ -50,6 +50,61 @@ public class SlayerTaskTargetsTest
 		assertFalse(SlayerTaskTargets.matches("Dagannoth Kings", "Dagannoth"));
 	}
 
+	/**
+	 * The three wilderness bosses each have a singles-plus variant that counts for the same
+	 * assignment, which is only ever handed out under the main boss's name.
+	 */
+	@Test
+	public void matchesWildernessBossVariants()
+	{
+		assertTrue(SlayerTaskTargets.matches("Vet'ion", "Calvar'ion"));
+		assertTrue(SlayerTaskTargets.matches("Vet'ion", "Vet'ion"));
+		// Both bosses fight on in a second form under a longer name.
+		assertTrue(SlayerTaskTargets.matches("Vet'ion", "Calvar'ion Reborn"));
+		assertTrue(SlayerTaskTargets.matches("Vet'ion", "Vet'ion Reborn"));
+		assertTrue(SlayerTaskTargets.matches("Callisto", "Artio"));
+		assertTrue(SlayerTaskTargets.matches("Callisto", "Callisto"));
+		assertTrue(SlayerTaskTargets.matches("Venenatis", "Spindel"));
+		assertTrue(SlayerTaskTargets.matches("Venenatis", "Venenatis"));
+		// The variants are not interchangeable across assignments.
+		assertFalse(SlayerTaskTargets.matches("Callisto", "Spindel"));
+		assertFalse(SlayerTaskTargets.matches("Venenatis", "Artio"));
+	}
+
+	/**
+	 * A venator counts for a vampyres assignment and shares no word with it, so only an alias can
+	 * connect the two. The relation is one-way and the lookup is keyed on the assignment, which
+	 * keeps it so: a vampyres task reaches a venator, a venators task reaches only venators.
+	 */
+	@Test
+	public void matchesVenatorsOnAVampyresTask()
+	{
+		assertTrue(SlayerTaskTargets.matches("Vampyres", "Venator"));
+		assertTrue(SlayerTaskTargets.matches("Vampyres", "Blood-starved venator"));
+		// The dedicated assignment reaches both on the singular strip, with no key of its own.
+		assertTrue(SlayerTaskTargets.matches("Venators", "Venator"));
+		assertTrue(SlayerTaskTargets.matches("Venators", "Blood-starved venator"));
+		// ...and no further. Vampyres do not count for a venators task.
+		assertFalse(SlayerTaskTargets.matches("Venators", "Vyrewatch"));
+		assertFalse(SlayerTaskTargets.matches("Venators", "Vyrewatch Sentinel"));
+		assertFalse(SlayerTaskTargets.matches("Venators", "Feral Vampyre"));
+		assertFalse(SlayerTaskTargets.matches("Venators", "Vampyre Juvinate"));
+		// The rest of the vampyres targets, which were never broken.
+		assertTrue(SlayerTaskTargets.matches("Vampyres", "Feral Vampyre"));
+		assertTrue(SlayerTaskTargets.matches("Vampyres", "Vampyre Juvinate"));
+		assertTrue(SlayerTaskTargets.matches("Vampyres", "Vampyre Juvenile"));
+		assertTrue(SlayerTaskTargets.matches("Vampyres", "Vyrewatch"));
+		assertTrue(SlayerTaskTargets.matches("Vampyres", "Vyrewatch Sentinel"));
+	}
+
+	/** The game spells the apostrophe both ways; neither may decide whether a kill counts. */
+	@Test
+	public void toleratesTypographicApostrophes()
+	{
+		assertTrue(SlayerTaskTargets.matches("Vet\u2019ion", "Calvar'ion"));
+		assertTrue(SlayerTaskTargets.matches("Vet'ion", "Calvar\u2019ion"));
+	}
+
 	@Test
 	public void usesWholeWordsAndRejectsUnrelatedNpcs()
 	{

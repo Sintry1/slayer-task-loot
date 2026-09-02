@@ -89,6 +89,28 @@ class SupplyTracker
 	}
 
 	/**
+	 * Coins and platinum tokens, which are the same wealth in two denominations.
+	 *
+	 * <p>Held as one family and measured in <em>gp</em> rather than in items, because they are the
+	 * one pair the client prices exactly — {@code ItemManager} hardcodes 1 gp a coin and 1000 gp a
+	 * token — and the one pair whose item counts are not commensurable at all. Exchanging a million
+	 * coins for a thousand tokens is a thousand items arriving against a million leaving; in items
+	 * that is an enormous loss and the transformation guard can't see it, so the whole balance was
+	 * billed as supplies. It was reported that way: alching through a task tracked correctly, then
+	 * converting the proceeds at the bank subtracted every coin of them from the profit.
+	 *
+	 * <p>Measured in gp both sides of the exchange are the same number and the family nets to zero,
+	 * so no charge can be built out of a denomination change however it is done — banker, interface
+	 * or otherwise. Coins genuinely spent still bill, at exactly their face value.
+	 */
+	private static final Set<Integer> CURRENCY_ITEMS = new HashSet<>(Arrays.asList(
+		ItemID.COINS, ItemID.COINS_2, ItemID.COINS_3, ItemID.COINS_4, ItemID.COINS_5,
+		ItemID.COINS_25, ItemID.COINS_100, ItemID.COINS_250, ItemID.COINS_1000,
+		ItemID.COINS_10000, ItemID.PLATINUM));
+
+	private static final String CURRENCY_FAMILY = "#currency";
+
+	/**
 	 * Ticks an unmatched drop stays outstanding. Long enough for the container update to land,
 	 * short enough that it can't swallow a real use of the same item later in the trip.
 	 */
@@ -120,7 +142,13 @@ class SupplyTracker
 
 	/** Explicit drops awaiting the container update that carries them out. */
 	private final Map<Integer, PendingIgnore> pendingIgnores = new HashMap<>();
+
+	/** What the last {@link #charge()} saw arrive, as itemId -> quantity gained. */
+	private final Map<Integer, Integer> lastGains = new HashMap<>();
 	private boolean eyeUsesTears = true;
+
+	/** Whether burying or scattering prayer remains counts as a supply. See the config item. */
+	private boolean chargePrayerRemains;
 
 	/**
 	 * Ammunition currently in the cannon's magazine. Only the load message says which of the
@@ -143,6 +171,36 @@ class SupplyTracker
 	{
 		snapshot = null;
 		pendingIgnores.clear();
+		lastGains.clear();
+	}
+
+	/**
+	 * Whether bones and ashes count as supplies when they are used up.
+	 *
+	 * <p>Deliberately not a resync. Nothing in the snapshot depends on the answer — only what the
+	 * diff is allowed to build a row out of — so re-baselining here would throw away whatever the
+	 * current tick had already consumed for no gain.
+	 */
+	boolean isChargingPrayerRemains()
+	{
+		return chargePrayerRemains;
+	}
+
+	void setChargePrayerRemains(boolean chargePrayerRemains)
+	{
+		this.chargePrayerRemains = chargePrayerRemains;
+	}
+
+	/**
+	 * What the last {@link #charge()} saw arrive, as itemId -> quantity.
+	 *
+	 * <p>Only bones and ashes ask, and only to tell "a bonecrusher consumed these where they fell"
+	 * apart from "the player picked them up and may bury them later" — the second is charged by the
+	 * ordinary diff when it happens, so charging it again from the drop would bill it twice.
+	 */
+	Map<Integer, Integer> gainsThisTick()
+	{
+		return Collections.unmodifiableMap(lastGains);
 	}
 
 	/**
@@ -290,6 +348,7 @@ class SupplyTracker
 
 		// Grouped by base name so dose variants of one potion are accounted for together.
 		final Map<String, Family> families = new LinkedHashMap<>();
+		lastGains.clear();
 
 		for (Integer id : ids)
 		{
@@ -299,6 +358,10 @@ class SupplyTracker
 			{
 				continue;
 			}
+			if (delta > 0)
+			{
+				lastGains.merge(id, delta, Integer::sum);
+			}
 			if (delta < 0 && isLootOnlyItem(id))
 			{
 				// Prayer remains and ensouled heads are loot rather than task supplies.
@@ -307,16 +370,18 @@ class SupplyTracker
 			}
 
 			final String name = itemName(id);
-			final int doses = doseCount(name);
-			final String base = doses > 0
-				? name.substring(0, name.lastIndexOf('(')).trim()
-				: familyKey(id, name);
+			final boolean currency = isCurrency(id);
+			final int doses = currency ? 0 : doseCount(name);
+			final int unitPrice = itemManager.getItemPrice(id);
+			final String base = currency
+				? CURRENCY_FAMILY
+				: doses > 0
+					? name.substring(0, name.lastIndexOf('(')).trim()
+					: familyKey(id, name);
 
 			final Family family = families.computeIfAbsent(base, k -> new Family());
-			family.value += (long) delta * itemManager.getItemPrice(id);
-			// Dose variants are commensurable only in doses: one 4-dose leaving and one
-			// 3-dose arriving is a single dose used, not two items changing hands.
-			family.units += (long) delta * Math.max(doses, 1);
+			family.value += (long) delta * unitPrice;
+			family.units += familyUnits(id, delta, doses, unitPrice);
 
 			if (doses > 0)
 			{
@@ -429,6 +494,24 @@ class SupplyTracker
 		return total <= 0 && rows.isEmpty() ? SupplyCharge.EMPTY : new SupplyCharge(total, rows);
 	}
 
+	/**
+	 * A whole-item consumption the carried diff can never see, because the item was used up before
+	 * it reached the player: a bonecrusher's bones, an ash sanctifier's ashes.
+	 *
+	 * <p>Priced and shaped exactly like the row the diff would have produced had the player buried
+	 * them by hand, so netting cancels it against the drop it came from either way.
+	 */
+	SupplyCharge consumedItem(int itemId, int quantity)
+	{
+		if (itemId <= 0 || quantity <= 0)
+		{
+			return SupplyCharge.EMPTY;
+		}
+		final long value = (long) itemManager.getItemPrice(itemId) * quantity;
+		return new SupplyCharge(value, Collections.singletonList(
+			new SupplyCharge.Row(itemId, quantity, value, false)));
+	}
+
 	SupplyCharge componentCharge(int... itemIdQuantityPairs)
 	{
 		long total = 0;
@@ -501,6 +584,33 @@ class SupplyTracker
 			new SupplyCharge.Row(chargedItemId, 1, total, false, components)));
 	}
 
+	/** Whether an item is coins or platinum tokens. See {@link #CURRENCY_ITEMS}. */
+	static boolean isCurrency(int itemId)
+	{
+		return CURRENCY_ITEMS.contains(itemId);
+	}
+
+	/**
+	 * What one item's movement contributes to its family's unit count, in whatever unit that
+	 * family is commensurable in.
+	 *
+	 * <p>Three units, and each exists because the one below it gets a real case wrong. Ordinary
+	 * items count in items. Dose variants count in <em>doses</em>, so a 4-dose leaving and a 3-dose
+	 * arriving is one dose used rather than two items changing hands. Coins and platinum tokens
+	 * count in <em>gp</em>, so exchanging a million coins for a thousand tokens is the same number
+	 * both ways instead of a 999,000-item loss — which is what got the whole balance billed as
+	 * supplies when a task's alching proceeds were converted at the bank.
+	 *
+	 * <p>The unit only has to make the two sides of a transformation cancel; the value column is
+	 * computed separately and is unaffected by the choice.
+	 */
+	static long familyUnits(int itemId, int delta, int doses, int unitPrice)
+	{
+		return isCurrency(itemId)
+			? (long) delta * unitPrice
+			: (long) delta * Math.max(doses, 1);
+	}
+
 	/** Resolves a dose family to its tradeable full container: (4), or (2) for mixes. */
 	private DosePrice resolveDosePrice(String base)
 	{
@@ -517,12 +627,21 @@ class SupplyTracker
 			{
 				continue;
 			}
-			if (name.equalsIgnoreCase(base + "(4)"))
+			// Matched on the parsed base and dose rather than by rebuilding the name, because the
+			// game is not consistent about the space before the dose: "Prayer potion(4)" but
+			// "Serum 207 (4)" and "Overload (4)". Concatenating base + "(4)" missed those two
+			// families outright, which silently dropped them out of dose netting altogether.
+			if (!base.equalsIgnoreCase(doseBaseName(name)))
+			{
+				continue;
+			}
+			final int doses = doseCount(name);
+			if (doses == 4)
 			{
 				best = new DosePrice(candidate.getId(), 4, itemManager.getItemPrice(candidate.getId()));
 				break;
 			}
-			if (name.equalsIgnoreCase(base + "(2)"))
+			if (doses == 2)
 			{
 				best = new DosePrice(candidate.getId(), 2, itemManager.getItemPrice(candidate.getId()));
 			}
@@ -581,13 +700,41 @@ class SupplyTracker
 		try
 		{
 			final ItemComposition comp = itemManager.getItemComposition(itemId);
-			return comp != null && (hasPrayerRemainsAction(comp.getInventoryActions())
-				|| isLootOnlyName(comp.getName()));
+			if (comp == null)
+			{
+				return false;
+			}
+			// An ensouled head is spent on a reanimation for the experience, and is loot however
+			// this is set. Only bones and ashes are in question.
+			if (isEnsouledHeadName(comp.getName()) || isSpentLootName(comp.getName()))
+			{
+				return true;
+			}
+			return !chargePrayerRemains && isPrayerRemains(comp);
 		}
 		catch (Exception ex)
 		{
 			return false;
 		}
+	}
+
+	/** Whether an item is bones or ashes, irrespective of whether they are being charged. */
+	boolean isPrayerRemains(int itemId)
+	{
+		try
+		{
+			return isPrayerRemains(itemManager.getItemComposition(itemId));
+		}
+		catch (Exception ex)
+		{
+			return false;
+		}
+	}
+
+	private static boolean isPrayerRemains(ItemComposition comp)
+	{
+		return comp != null && (hasPrayerRemainsAction(comp.getInventoryActions())
+			|| isPrayerRemainsName(comp.getName()));
 	}
 
 	/** Testable classification shared by every kind of bone and demonic ash. */
@@ -609,13 +756,53 @@ class SupplyTracker
 
 	static boolean isLootOnlyName(String name)
 	{
+		return isPrayerRemainsName(name) || isEnsouledHeadName(name) || isSpentLootName(name);
+	}
+
+	/**
+	 * Untradeable loot that is spent rather than bought: a tarnished item polished into the weapon
+	 * or jewellery it becomes, and a venator heart sacrificed at an Aranei shrine. Both arrive as
+	 * drops of the task that is billing them, and neither was ever a supply.
+	 *
+	 * <p>Billed, they take the unpriced-consumption branch and post a 0 gp row, netting cancels
+	 * that against the drop, and both sides reach zero and are deleted — so a tarnished spear
+	 * polished into a rune spear left no trace in either column. The row was the visible half; the
+	 * invisible half is that the drop it cancelled was the only record the task had of it.
+	 *
+	 * <p>Matched by name rather than by any property of the item. "Untradeable and unpriced" would
+	 * be the general rule and it is too wide: it would quietly stop billing genuine supplies that
+	 * happen to price at zero, which is the failure this codebase keeps meeting from the other
+	 * direction. An explicit set undercounts a name nobody has added yet, which is a row that reads
+	 * 0 gp rather than a cost that silently disappears.
+	 */
+	static boolean isSpentLootName(String name)
+	{
 		if (name == null)
 		{
 			return false;
 		}
 		final String lower = name.toLowerCase(java.util.Locale.ROOT);
-		return lower.endsWith(" ashes") || lower.endsWith(" bones")
-			|| (lower.startsWith("ensouled ") && lower.endsWith(" head"));
+		return lower.startsWith("tarnished ") || lower.equals("venator heart");
+	}
+
+	static boolean isPrayerRemainsName(String name)
+	{
+		if (name == null)
+		{
+			return false;
+		}
+		final String lower = name.toLowerCase(java.util.Locale.ROOT);
+		return lower.endsWith(" ashes") || lower.endsWith(" bones");
+	}
+
+	static boolean isEnsouledHeadName(String name)
+	{
+		if (name == null)
+		{
+			return false;
+		}
+		final String lower = name.toLowerCase(java.util.Locale.ROOT);
+		return lower.startsWith("ensouled ") && lower.endsWith(" head");
 	}
 
 	Map<Integer, Integer> takeRunePouchSnapshot()
@@ -623,6 +810,21 @@ class SupplyTracker
 		final Map<Integer, Integer> snapshot = new HashMap<>();
 		addRunePouch(snapshot);
 		return snapshot;
+	}
+
+	/**
+	 * An item name with its "(n)" removed, or null when the name isn't a dose container.
+	 *
+	 * <p>Trimmed, because the space before the dose is present in some names and not others.
+	 */
+	static String doseBaseName(String name)
+	{
+		if (name == null || doseCount(name) <= 0)
+		{
+			return null;
+		}
+		final int open = name.lastIndexOf('(');
+		return open <= 0 ? null : name.substring(0, open).trim();
 	}
 
 	/**
