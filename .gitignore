@@ -4,4 +4,5 @@ bin/
 .idea/
 *.class
 .claude/
-
+tools/
+NOTES.md
