@@ -23,6 +23,28 @@ public class SlayerTaskTargetsTest
 	}
 
 	/**
+	 * Araxxor's hatched minions award slayer experience and count towards the helmet, but killing
+	 * one never moves the assignment counter and never drops anything. Counting them booked three
+	 * or four kills for every Araxxor actually killed — a dozen kills read as 38.
+	 */
+	@Test
+	public void doesNotCountAraxxorMinionsAsKills()
+	{
+		for (String minion : new String[]{"Mirrorback Araxyte", "Ruptura Araxyte", "Acidic Araxyte"})
+		{
+			// Still part of the fight, so supplies spent on them still belong to the task.
+			assertTrue(minion, SlayerTaskTargets.matches("Araxytes", minion));
+			assertFalse(minion, SlayerTaskTargets.countsTowardTask("Araxytes", minion));
+			assertFalse(minion, SlayerTaskTargets.countsTowardTask("Spiders", minion));
+		}
+
+		// Everything the assignment does count still counts, the superior included.
+		assertTrue(SlayerTaskTargets.countsTowardTask("Araxytes", "Araxyte"));
+		assertTrue(SlayerTaskTargets.countsTowardTask("Araxytes", "Araxxor"));
+		assertTrue(SlayerTaskTargets.countsTowardTask("Araxytes", "Dreadborn Araxyte"));
+	}
+
+	/**
 	 * A boss whose name ends in an s is not a plural. Singularising first left "sarachni", which
 	 * matched the NPC nowhere, so the assignment recognised none of its own kills: the counter
 	 * still banked them, but no session opened and neither loot nor supplies could attach.

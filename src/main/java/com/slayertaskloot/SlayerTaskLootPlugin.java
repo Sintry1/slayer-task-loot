@@ -1127,7 +1127,7 @@ public class SlayerTaskLootPlugin extends Plugin
 		}
 
 		if (sinceCredit <= CREDIT_MATCH_TOLERANCE
-			&& SlayerTaskTargets.matches(activeTask.getTaskName(), loot.npcName))
+			&& SlayerTaskTargets.countsTowardTask(activeTask.getTaskName(), loot.npcName))
 		{
 			return true;
 		}
@@ -1161,7 +1161,7 @@ public class SlayerTaskLootPlugin extends Plugin
 	private void noteNpcDeath(NPC npc)
 	{
 		if (npc.getName() == null || activeTask == null
-			|| !SlayerTaskTargets.matches(activeTask.getTaskName(), npc.getName()))
+			|| !SlayerTaskTargets.countsTowardTask(activeTask.getTaskName(), npc.getName()))
 		{
 			return;
 		}
@@ -1234,7 +1234,7 @@ public class SlayerTaskLootPlugin extends Plugin
 	private String confirmLootDeath(PendingLoot loot)
 	{
 		if (activeTask == null
-			|| !SlayerTaskTargets.matches(activeTask.getTaskName(), loot.npcName))
+			|| !SlayerTaskTargets.countsTowardTask(activeTask.getTaskName(), loot.npcName))
 		{
 			return null;
 		}

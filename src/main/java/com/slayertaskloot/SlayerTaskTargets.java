@@ -3,9 +3,11 @@ package com.slayertaskloot;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Pattern;
 
@@ -17,6 +19,18 @@ final class SlayerTaskTargets
 {
 	private static final Map<String, List<String>> TASK_ALIASES;
 	private static final Map<String, List<String>> TASK_EXACT_ALIASES;
+
+	/**
+	 * Monsters that are named after an assignment's targets, and award slayer experience, but that
+	 * the assignment itself does not count. See {@link #countsTowardTask}.
+	 *
+	 * <p>Normalised names, matched exactly, so nothing that merely shares a word is swept up with
+	 * them — the superior "Dreadborn Araxyte" is a genuine araxyte kill and is not in here.
+	 */
+	private static final Set<String> NON_COUNTING = Collections.unmodifiableSet(new HashSet<>(
+		// The three minions Araxxor hatches. They give slayer experience and count for the helmet,
+		// but they never move the assignment counter and never drop anything.
+		Arrays.asList("mirrorback araxyte", "ruptura araxyte", "acidic araxyte")));
 
 	/** Compiled whole-word patterns, keyed on the needle. See {@link #needlePattern}. */
 	private static final Map<String, Pattern> NEEDLE_PATTERNS = new ConcurrentHashMap<>();
@@ -154,6 +168,24 @@ final class SlayerTaskTargets
 
 	private SlayerTaskTargets()
 	{
+	}
+
+	/**
+	 * Whether killing this NPC is a kill the assignment counts.
+	 *
+	 * <p>Stricter than {@link #matches}, which asks only whether the NPC belongs to the
+	 * assignment's family. Araxxor's hatched minions do belong to an araxyte task — they award
+	 * slayer experience and count towards the helmet — yet killing one leaves the assignment
+	 * counter where it was, so counting them reported three or four kills per Araxxor.
+	 *
+	 * <p>{@link #matches} is deliberately left alone: the minions are still part of the fight for
+	 * the purposes of deciding whether the player is in combat with their task, and so of what the
+	 * fight's supplies are billed to.
+	 */
+	static boolean countsTowardTask(String taskName, String npcName)
+	{
+		return matches(taskName, npcName)
+			&& !NON_COUNTING.contains(normalise(npcName));
 	}
 
 	static boolean matches(String taskName, String npcName)
