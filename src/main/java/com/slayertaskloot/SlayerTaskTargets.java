@@ -6,6 +6,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Pattern;
 
 /**
@@ -16,6 +17,9 @@ final class SlayerTaskTargets
 {
 	private static final Map<String, List<String>> TASK_ALIASES;
 	private static final Map<String, List<String>> TASK_EXACT_ALIASES;
+
+	/** Compiled whole-word patterns, keyed on the needle. See {@link #needlePattern}. */
+	private static final Map<String, Pattern> NEEDLE_PATTERNS = new ConcurrentHashMap<>();
 
 	static
 	{
@@ -181,7 +185,11 @@ final class SlayerTaskTargets
 				return true;
 			}
 
-			if (wholeWordMatch(npc, candidate.replaceAll("s$", "")))
+			// Equivalent to replaceAll("s$", ""), without compiling a pattern per call.
+			final String singular = candidate.endsWith("s")
+				? candidate.substring(0, candidate.length() - 1)
+				: candidate;
+			if (wholeWordMatch(npc, singular))
 			{
 				return true;
 			}
@@ -247,7 +255,19 @@ final class SlayerTaskTargets
 		{
 			return false;
 		}
-		final String regex = "(?:\\s|^)" + Pattern.quote(needle) + "(?:\\s|$)";
-		return Pattern.compile(regex, Pattern.CASE_INSENSITIVE).matcher(haystack).find();
+		return needlePattern(needle).matcher(haystack).find();
+	}
+
+	/**
+	 * The compiled whole-word pattern for a needle, compiled once and reused.
+	 *
+	 * <p>{@link #matches} reaches this a dozen times per call and is itself called for every
+	 * hitsplat the player deals, so compiling a fresh pattern each time was the bulk of the cost
+	 * on that path. The key set is bounded by the task names and aliases the tables above hold.
+	 */
+	private static Pattern needlePattern(String needle)
+	{
+		return NEEDLE_PATTERNS.computeIfAbsent(needle,
+			n -> Pattern.compile("(?:\\s|^)" + Pattern.quote(n) + "(?:\\s|$)", Pattern.CASE_INSENSITIVE));
 	}
 }
