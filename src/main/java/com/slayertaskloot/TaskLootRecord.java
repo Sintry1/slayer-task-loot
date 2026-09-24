@@ -306,11 +306,16 @@ class TaskLootRecord
 
 	TaskSession resumeSession(String sessionId, long now)
 	{
+		return resumeSession(sessionId, now, true);
+	}
+
+	TaskSession resumeSession(String sessionId, long now, boolean openedManually)
+	{
 		for (TaskSession session : getTaskSessions())
 		{
 			if (session.getSessionId().equals(sessionId))
 			{
-				session.resume(now);
+				session.resume(now, openedManually);
 				return session;
 			}
 		}

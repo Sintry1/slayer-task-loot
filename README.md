@@ -32,9 +32,13 @@ Profit                          988k gp
 
 Supplies are measured from your inventory, worn equipment and rune pouch, so food, potions, runes, ammunition and teleports are all covered (assuming a session is in progress) without a list of items to maintain. Potions are counted in **doses**, not bottles.
 
+Food eaten in more than one bite is counted the same way: a pie is two **portions**, a cake three, and each bite costs its share of the whole. Half a pie left in your inventory at the end is half a pie you haven't paid for.
+
 Charged weapons appear as a single row named after the weapon. Hover it to see what its charges cost.
 
-Things that aren't consumption don't get charged: banking, shops, trades, the Grand Exchange, dying, dropping an item, or setting up and picking up a cannon.
+Things that aren't consumption don't get charged: banking, shops, trades, the Grand Exchange, dying, dropping an item, setting up and picking up a cannon, or crafting one item out of others.
+
+Teleporting away pauses the session a few seconds after you land, so the teleport itself is charged but whatever you do afterwards isn't. Your next task kill resumes the same session.
 
 By default, drops and supplies of the same item cancel out — five sharks dropped and two eaten shows three sharks and no shark cost. Turn off **Net matching drops** to see both. Potions cancel too, in doses. A `Prayer potion(3)` dropped and two doses drunk shows a `Prayer potion(1)` in Drops and no prayer potion cost — the container you're actually left holding. Drops and doses are pooled per potion, so the remainder is repacked into the largest containers that hold it; five doses left over read as a `(4)` and a `(1)`.
 

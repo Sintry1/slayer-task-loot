@@ -31,6 +31,7 @@ import net.runelite.api.Client;
 import net.runelite.api.ChatMessageType;
 import net.runelite.api.EquipmentInventorySlot;
 import net.runelite.api.GameState;
+import net.runelite.api.HashTable;
 import net.runelite.api.ItemComposition;
 import net.runelite.api.MenuAction;
 import net.runelite.api.NPC;
@@ -38,7 +39,10 @@ import net.runelite.api.NPCComposition;
 import net.runelite.api.Player;
 import net.runelite.api.Tile;
 import net.runelite.api.TileItem;
+import net.runelite.api.WidgetNode;
 import net.runelite.api.WorldView;
+import net.runelite.api.coords.LocalPoint;
+import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.events.ActorDeath;
 import net.runelite.api.events.AnimationChanged;
 import net.runelite.api.events.ChatMessage;
@@ -103,6 +107,14 @@ public class SlayerTaskLootPlugin extends Plugin
 	private static final int[] RESYNC_INTERFACES = {
 		InterfaceID.BANKMAIN,
 		InterfaceID.BANK_DEPOSITBOX,
+		InterfaceID.BANK_DEPOSIT_IMP,
+		// Every other place items are put away rather than used up. A looting bag is the one
+		// that costs loot rather than supplies: on a wilderness task the drops go into the bag,
+		// and items leaving the inventory is exactly what a supply looks like from here.
+		InterfaceID.WILDERNESS_LOOTINGBAG,
+		InterfaceID.SEED_VAULT,
+		InterfaceID.SEED_VAULT_DEPOSIT,
+		InterfaceID.SHARED_BANK,
 		InterfaceID.SHOPMAIN,
 		InterfaceID.TRADEMAIN,
 		InterfaceID.GE_OFFERS,
@@ -114,6 +126,18 @@ public class SlayerTaskLootPlugin extends Plugin
 		InterfaceID.DEATH_COFFER_SIDE,
 		InterfaceID.GRAVESTONE_GENERIC,
 	};
+
+	/**
+	 * Ticks the re-baseline is held for after the last of those interfaces closes.
+	 *
+	 * <p>The container update an interface causes doesn't have to arrive while it is still open.
+	 * Depositing a stack and closing the bank in one motion lands the removal on a tick with
+	 * nothing open, and a removal with nothing open is exactly what consumption looks like — which
+	 * is how a Grand Exchange purchase carried to the bank was billed as supplies, a whole holding
+	 * of teleport tablets at once. Holding the re-baseline a moment longer costs at most a couple
+	 * of ticks of genuine consumption either side of a bank visit.
+	 */
+	private static final int RESYNC_SETTLE_TICKS = 2;
 	/**
 	 * Ticks a credited bone or ash drop is watched for before deciding it never reached the player.
 	 * Long enough for the container update to land, short enough that the prayer experience it is
@@ -173,6 +197,8 @@ public class SlayerTaskLootPlugin extends Plugin
 	 * be a coin flip.
 	 */
 	private static final int CREDIT_MATCH_TOLERANCE = 2;
+	/** How long a credited kill waits for loot that has to be collected — thirty minutes. */
+	private static final int UNCLAIMED_LOOT_MAX_TICKS = 3000;
 	/** A ground-item click may take several ticks to reach while the player walks to it. */
 	private static final int PICKUP_ACTION_EXPIRY_TICKS = 20;
 
@@ -186,6 +212,29 @@ public class SlayerTaskLootPlugin extends Plugin
 	 * Gathering a barrage stack is the case that needs the room.
 	 */
 	private static final int MAX_GRACE_TICKS = 1000;
+
+	/**
+	 * Tiles the player has to move in a single tick for it to count as a teleport. Running covers
+	 * two tiles a tick and agility shortcuts a handful, so anything past this was a teleport, a
+	 * dungeon entrance or a respawn.
+	 */
+	static final int TELEPORT_MIN_TILES = 20;
+
+	/**
+	 * Ticks after a teleport before the session pauses — six seconds.
+	 *
+	 * <p>A session used to run on for the whole idle timeout after the last kill, and everything
+	 * done in that time was billed to the task: an Araxxor trip was charged for a Grand Exchange
+	 * purchase crafted into an amulet of rancour, brimstone keys opened at the chest, and a farm
+	 * run's seeds, spade and plant cure. Leaving the task is nearly always a teleport, so that is
+	 * where the session now stops. The delay is what keeps the teleport itself on the task: a
+	 * tablet leaves the inventory several ticks before the player lands, and runes and jewellery
+	 * charges on the tick of the cast.
+	 */
+	private static final int TELEPORT_PAUSE_DELAY_TICKS = 10;
+
+	/** Close reason for a session paused by a teleport, which the next kill resumes. */
+	private static final String TELEPORT_PAUSE_REASON = "TELEPORT";
 
 	/**
 	 * How far before a hitsplat the engagement is taken to have started.
@@ -452,6 +501,12 @@ public class SlayerTaskLootPlugin extends Plugin
 	/** Tick the counter reached zero, or -1. Keeps a finished task open for its late loot. */
 	private int taskEndTick = -1;
 	private boolean supplyResyncPending;
+	/** Whether item movement this tick is something other than consumption. Set once per tick. */
+	private boolean resyncHeld;
+	/** Ticks of {@link #RESYNC_SETTLE_TICKS} left since a resync interface was last seen open. */
+	private int resyncHoldTicks;
+	/** Whether the bank's contents changed during this tick's packets. See onItemContainerChanged. */
+	private boolean bankChangedThisTick;
 	/** Ticks of settling left after a death, or -1 when no death is being waited out. */
 	private int deathSettleTicks = -1;
 	/** Ticks the current settling period may still be held for at most. See DEATH_SETTLE_MAX_TICKS. */
@@ -481,6 +536,21 @@ public class SlayerTaskLootPlugin extends Plugin
 	 * of the engagement, not a threshold for when one fight becomes two.
 	 */
 	private int combatStartTick = -1;
+
+	/** Latest tick the player damaged a task-relevant NPC, or -1. */
+	private int lastTaskHitTick = -1;
+
+	/** Where the player stood last tick, so a teleport can be seen. Null until the first tick. */
+	private WorldPoint lastPlayerLocation;
+
+	/** As {@link #lastPlayerLocation}, but the real map tile an instance was copied from. */
+	private WorldPoint lastTemplateLocation;
+
+	/** Whether a loading screen has come and gone since the last tick. */
+	private boolean loadedSinceLastTick;
+
+	/** Tick of a teleport the open session is waiting to pause after, or -1. */
+	private int teleportTick = -1;
 
 	/** Previous magazine reading, so a cannon firing can be seen. -1 until the first tick. */
 	private int lastCannonballCount = -1;
@@ -570,6 +640,14 @@ public class SlayerTaskLootPlugin extends Plugin
 		quiverShotTick = -1;
 		specialEnergyLastSeen = -1;
 		lastCannonballCount = -1;
+		lastTaskHitTick = -1;
+		lastPlayerLocation = null;
+		lastTemplateLocation = null;
+		loadedSinceLastTick = false;
+		teleportTick = -1;
+		resyncHeld = false;
+		resyncHoldTicks = 0;
+		bankChangedThisTick = false;
 		supplyTracker.clear();
 	}
 
@@ -946,11 +1024,38 @@ public class SlayerTaskLootPlugin extends Plugin
 			return;
 		}
 
+		final long now = System.currentTimeMillis();
+		final TaskSession paused = activeTask.latestClosedSession();
+		if (paused != null && isResumableTeleportPause(paused.lastCloseReason(), paused.getEndedAt(),
+			now, config.sessionTimeout()))
+		{
+			// A teleport paused it, and this kill is the return. Carrying on in the same session
+			// is what "paused" means; opening a new one on every trip out made a single afternoon
+			// of an assignment read as twenty sessions.
+			activeTask.resumeSession(paused.getSessionId(), now, false);
+			activeSessionId = paused.getSessionId();
+		}
+		else
+		{
+			activeSessionId = activeTask.openNewSession(now, false).getSessionId();
+		}
 		sessionOpen = true;
-		activeSessionId = activeTask.openNewSession(System.currentTimeMillis(), false).getSessionId();
 
 		log.debug("Session {} open, replayed {} gp of grace-window supplies",
 			activeTask.getSessions(), replayGraceBuffer(activeSessionId));
+	}
+
+	/**
+	 * Whether a kill should carry on a closed session rather than open a new one: it was paused by
+	 * a teleport, not ended, and the player is back within the idle timeout. Past that, the trip
+	 * out was a break rather than a restock, and the idle timeout would have ended it anyway.
+	 */
+	static boolean isResumableTeleportPause(@Nullable String closeReason, long endedAt, long now,
+		int timeoutMinutes)
+	{
+		return TELEPORT_PAUSE_REASON.equals(closeReason)
+			&& endedAt > 0
+			&& now - endedAt <= timeoutMinutes * 60_000L;
 	}
 
 	private void closeSession()
@@ -966,6 +1071,7 @@ public class SlayerTaskLootPlugin extends Plugin
 		}
 		sessionOpen = false;
 		activeSessionId = null;
+		teleportTick = -1;
 		clearGraceBuffer();
 	}
 
@@ -1132,8 +1238,23 @@ public class SlayerTaskLootPlugin extends Plugin
 			return true;
 		}
 
-		return sinceCredit <= toTicks(config.lootCreditWindow())
+		return (sinceCredit <= toTicks(config.lootCreditWindow()) || loot.claimedWaitingKill)
 			&& confirmedTargets.contains(loot.npcName);
+	}
+
+	/**
+	 * How long a credited kill's token is kept for its loot to claim it.
+	 *
+	 * <p>Once claimed, only the late-loot window, as before. Unclaimed, much longer: a boss whose
+	 * corpse is harvested can be left for as long as the player likes, and an Araxxor kill looted
+	 * fifteen minutes later lost its drop — an araxyte fang — because the token had long expired
+	 * and the loot no longer counted. Each kill has at most one loot, so an unclaimed token can
+	 * only ever be claimed by the loot of that kill.
+	 */
+	private int lootWaitTicks(RecentDeath death)
+	{
+		final int window = toTicks(config.lootCreditWindow());
+		return death.credited && !death.lootClaimed ? Math.max(window, UNCLAIMED_LOOT_MAX_TICKS) : window;
 	}
 
 	/**
@@ -1239,29 +1360,49 @@ public class SlayerTaskLootPlugin extends Plugin
 			return null;
 		}
 
+		final int window = toTicks(config.lootCreditWindow());
 		RecentDeath matched = null;
 		if (loot.npcIndex >= 0)
 		{
 			final RecentDeath indexed = recentDeaths.get(loot.npcIndex);
 			if (indexed != null && indexed.npcName.equals(loot.npcName)
 				&& loot.tick - indexed.tick >= -CREDIT_MATCH_TOLERANCE
-				&& loot.tick - indexed.tick <= toTicks(config.lootCreditWindow()))
+				&& loot.tick - indexed.tick <= lootWaitTicks(indexed))
 			{
 				matched = indexed;
 			}
 		}
+		// A kill still inside the late-loot window is preferred, so a drop landing as its monster
+		// dies is never paired with some older kill that is still waiting. Only failing that, the
+		// oldest kill left waiting past the window — harvested corpses are looted in kill order.
+		RecentDeath waiting = null;
 		for (RecentDeath death : recentDeaths.values())
 		{
-			if (matched == null && !death.lootClaimed && death.npcName.equals(loot.npcName)
-				&& loot.tick - death.tick >= -CREDIT_MATCH_TOLERANCE
-				&& loot.tick - death.tick <= toTicks(config.lootCreditWindow())
-				&& (matched == null || death.tick < matched.tick))
+			if (matched != null)
+			{
+				break;
+			}
+			final int age = loot.tick - death.tick;
+			if (death.lootClaimed || !death.npcName.equals(loot.npcName) || age < -CREDIT_MATCH_TOLERANCE)
+			{
+				continue;
+			}
+			if (age <= window)
 			{
 				matched = death;
 			}
+			else if (age <= lootWaitTicks(death) && (waiting == null || death.tick < waiting.tick))
+			{
+				waiting = death;
+			}
+		}
+		if (matched == null)
+		{
+			matched = waiting;
 		}
 		if (matched != null)
 		{
+			loot.claimedWaitingKill = matched.credited && loot.tick - matched.tick > window;
 			if (!matched.credited)
 			{
 				creditEligibleDeath(matched);
@@ -1297,7 +1438,7 @@ public class SlayerTaskLootPlugin extends Plugin
 				creditEligibleDeath(death);
 			}
 			final int retention = death.credited
-				? toTicks(config.lootCreditWindow())
+				? lootWaitTicks(death)
 				: CREDIT_MATCH_TOLERANCE;
 			if (death.tick < now - retention)
 			{
@@ -1321,6 +1462,15 @@ public class SlayerTaskLootPlugin extends Plugin
 		if (event.getContainerId() == InventoryID.INV)
 		{
 			collectionInventoryDirty = true;
+		}
+		else if (event.getContainerId() == InventoryID.BANK)
+		{
+			// The bank's own contents moving is proof that this tick's inventory change was a
+			// deposit or a withdrawal, whatever any interface says — and unlike an interface it
+			// cannot be late, because it is the other half of the same update. Depositing a stack
+			// and closing the bank in one motion is what the widget test misses; this catches it
+			// on the tick it happens, so nothing has to be forgiven afterwards on suspicion.
+			bankChangedThisTick = true;
 		}
 	}
 
@@ -1391,6 +1541,11 @@ public class SlayerTaskLootPlugin extends Plugin
 			// Soul bearers and similar remote-deposit items transfer inventory to storage.
 			// Re-baseline on the resulting tick so the transfer is never billed as usage.
 			supplyResyncPending = true;
+		}
+
+		if (isItemCraftAction(option, event.getMenuAction()))
+		{
+			supplyTracker.noteCraftAttempt();
 		}
 
 		if ("Polish".equalsIgnoreCase(option))
@@ -1520,6 +1675,33 @@ public class SlayerTaskLootPlugin extends Plugin
 			|| "Deposit".equalsIgnoreCase(option)
 			|| "Bank".equalsIgnoreCase(option)
 			|| "Bank-All".equalsIgnoreCase(option);
+	}
+
+	/** Inventory options that make one item out of others, as opposed to using one up. */
+	private static final Set<String> CRAFT_OPTIONS = new HashSet<>(Arrays.asList(
+		"combine", "assemble", "attach", "craft", "create", "make", "make-all", "etch"));
+
+	/**
+	 * Whether a click may be the start of making something out of carried items: an item used on
+	 * another item, an object or an NPC, or an option that names the act. Spells cast on items are
+	 * "Cast" rather than "Use", so alchemy and enchanting never match.
+	 *
+	 * <p>Only a hint. {@link SupplyTracker#noteCraftAttempt()} still needs a new item to arrive
+	 * before it forgives anything, so a wrong guess here costs nothing by itself.
+	 */
+	static boolean isItemCraftAction(String option, MenuAction action)
+	{
+		if (option == null)
+		{
+			return false;
+		}
+		if ("Use".equalsIgnoreCase(option))
+		{
+			return action == MenuAction.WIDGET_TARGET_ON_WIDGET
+				|| action == MenuAction.WIDGET_TARGET_ON_GAME_OBJECT
+				|| action == MenuAction.WIDGET_TARGET_ON_NPC;
+		}
+		return CRAFT_OPTIONS.contains(option.toLowerCase(java.util.Locale.ROOT));
 	}
 
 	static boolean isAlchemyCast(String option, String target)
@@ -2145,7 +2327,7 @@ public class SlayerTaskLootPlugin extends Plugin
 			return;
 		}
 
-		if (isResyncInterfaceOpen())
+		if (resyncHeld)
 		{
 			// Banking, trading or shopping — re-baseline so restocking isn't charged.
 			supplyTracker.resync();
@@ -2420,7 +2602,7 @@ public class SlayerTaskLootPlugin extends Plugin
 		// combined carried snapshot every tick so automatic pouch pickup is observable.
 		collectionInventoryDirty = false;
 		final Map<Integer, Integer> current = takeInventorySnapshot();
-		if (collectionInventorySnapshot != null && !isResyncInterfaceOpen())
+		if (collectionInventorySnapshot != null && !resyncHeld)
 		{
 			for (Map.Entry<Integer, Integer> entry : current.entrySet())
 			{
@@ -2575,6 +2757,28 @@ public class SlayerTaskLootPlugin extends Plugin
 	 */
 	private boolean isResyncInterfaceOpen()
 	{
+		// The client's own list of what is open, which is the question being asked. The widget
+		// probe below reads one component of an interface and infers the rest, and what it infers
+		// depends on which component happens to be child 0 of that group and on whether that
+		// component is one the interface leaves hidden — neither of which is anything to do with
+		// the interface being open. Kept underneath it all the same: it costs nothing, and between
+		// the two of them a missed close can only ever make this answer "open" when it isn't,
+		// which forgives a supply rather than inventing one.
+		final HashTable<WidgetNode> open = client.getComponentTable();
+		if (open != null)
+		{
+			for (WidgetNode node : open)
+			{
+				for (int groupId : RESYNC_INTERFACES)
+				{
+					if (node.getId() == groupId)
+					{
+						return true;
+					}
+				}
+			}
+		}
+
 		for (int groupId : RESYNC_INTERFACES)
 		{
 			final Widget widget = client.getWidget(groupId, 0);
@@ -2586,6 +2790,39 @@ public class SlayerTaskLootPlugin extends Plugin
 		return false;
 	}
 
+	/**
+	 * Decides once a tick whether item movement can be read as consumption, for both loot modes
+	 * to use, and keeps saying no for a short while after the interface goes away. See
+	 * {@link #RESYNC_SETTLE_TICKS}.
+	 */
+	private void updateResyncHold()
+	{
+		final boolean wasHeld = resyncHeld;
+		final boolean banking = bankChangedThisTick;
+		bankChangedThisTick = false;
+		if (banking || isResyncInterfaceOpen())
+		{
+			resyncHoldTicks = RESYNC_SETTLE_TICKS;
+			resyncHeld = true;
+		}
+		else
+		{
+			resyncHeld = resyncHoldTicks > 0;
+			if (resyncHoldTicks > 0)
+			{
+				resyncHoldTicks--;
+			}
+		}
+
+		if (wasHeld != resyncHeld)
+		{
+			// Both ends of the hold, because a charge that shouldn't have happened is otherwise
+			// indistinguishable from one that should, and the first question to ask of one that
+			// happened at a bank or the Grand Exchange is whether this ever read the interface.
+			log.debug("Item movement is {} consumption from here", resyncHeld ? "not" : "again");
+		}
+	}
+
 	// ------------------------------------------------------------------
 	// Tick loop
 	// ------------------------------------------------------------------
@@ -2595,6 +2832,7 @@ public class SlayerTaskLootPlugin extends Plugin
 	public void onGameTick(GameTick event)
 	{
 		final int now = client.getTickCount();
+		updateResyncHold();
 		processCannonCombat(now);
 		processRepeatingWeaponUsage(now);
 		processSpecialAttackCharges(now);
@@ -2607,6 +2845,7 @@ public class SlayerTaskLootPlugin extends Plugin
 		resolvePendingPickupFallbacks(now);
 		processCollectedLoot();
 		processSupplies();
+		processTeleportPause(now);
 
 		if (sessionOpen && activeTask != null)
 		{
@@ -2647,7 +2886,8 @@ public class SlayerTaskLootPlugin extends Plugin
 		// mean a boss whose loot has to be collected — Araxxor, say — loses its final drop,
 		// because there'd be no active task left for it to land on by the time it arrives.
 		if (activeTask != null && activeTask.isCompleted() && pendingLoot.isEmpty()
-			&& taskEndTick >= 0 && now - taskEndTick > toTicks(config.lootCreditWindow()))
+			&& taskEndTick >= 0 && now - taskEndTick > toTicks(config.lootCreditWindow())
+			&& !isFinalKillAwaitingLoot())
 		{
 			archiveActiveTask();
 			pushToPanel();
@@ -2666,6 +2906,24 @@ public class SlayerTaskLootPlugin extends Plugin
 		{
 			persist();
 		}
+	}
+
+	/**
+	 * Whether the kill that finished the assignment is still waiting for its loot, so the task is
+	 * kept open for it. The token expires on its own (see {@link #lootWaitTicks}), and a new
+	 * assignment archives the task regardless, so this can't hold a task open indefinitely.
+	 */
+	private boolean isFinalKillAwaitingLoot()
+	{
+		for (RecentDeath death : recentDeaths.values())
+		{
+			if (death.credited && !death.lootClaimed
+				&& Math.abs(death.tick - taskEndTick) <= CREDIT_MATCH_TOLERANCE)
+			{
+				return true;
+			}
+		}
+		return false;
 	}
 
 	/** Flags that the stored snapshot and the panel are both behind the live state. */
@@ -2695,8 +2953,99 @@ public class SlayerTaskLootPlugin extends Plugin
 		}
 		if (isTaskRelevant(((NPC) event.getActor()).getName()))
 		{
-			noteCombat(client.getTickCount());
+			lastTaskHitTick = client.getTickCount();
+			noteCombat(lastTaskHitTick);
 		}
+	}
+
+	/**
+	 * Pauses the open session a few seconds after the player teleports. See
+	 * {@link #TELEPORT_PAUSE_DELAY_TICKS}.
+	 *
+	 * <p>Run after the tick's supplies are billed, so whatever paid for the teleport is charged
+	 * while the session is still open. A kill or a blow landed on the task after the jump cancels
+	 * the pause: that was a teleport <em>to</em> the task, or into a boss's instance, and the
+	 * session is exactly where it should be.
+	 */
+	private void processTeleportPause(int now)
+	{
+		final Player local = client.getLocalPlayer();
+		final WorldPoint location = local == null ? null : local.getWorldLocation();
+		final LocalPoint localPoint = local == null ? null : local.getLocalLocation();
+		final WorldPoint template = localPoint == null
+			? null
+			: WorldPoint.fromLocalInstance(client, localPoint);
+		final WorldPoint previous = lastPlayerLocation;
+		final WorldPoint previousTemplate = lastTemplateLocation;
+		final boolean loaded = loadedSinceLastTick;
+		lastPlayerLocation = location;
+		lastTemplateLocation = template;
+		loadedSinceLastTick = false;
+
+		if (!sessionOpen)
+		{
+			teleportTick = -1;
+			return;
+		}
+		if (isTeleport(previous, location, previousTemplate, template, loaded))
+		{
+			log.debug("Teleport from {} to {}, pausing the session in {} ticks",
+				previous, location, TELEPORT_PAUSE_DELAY_TICKS);
+			teleportTick = now;
+			return;
+		}
+		if (teleportTick < 0)
+		{
+			return;
+		}
+		if (lastCreditTick >= teleportTick || lastTaskHitTick >= teleportTick)
+		{
+			teleportTick = -1;
+			return;
+		}
+		if (now - teleportTick >= TELEPORT_PAUSE_DELAY_TICKS)
+		{
+			log.debug("Session paused after a teleport");
+			closeSession(TELEPORT_PAUSE_REASON);
+			markDirty();
+		}
+	}
+
+	/**
+	 * Whether the player was teleported between two ticks, judged by where they stand rather than
+	 * by how they got there.
+	 *
+	 * <p>A teleport is the one thing that moves a player's coordinates by more than a couple of
+	 * tiles in a tick, whatever caused it: spells, tablets, jewellery, fairy rings, spirit trees,
+	 * house portals, a respawn. Recognising the cause instead would need every teleport animation
+	 * in the game listed, would miss the ones that play none, and would need revisiting whenever
+	 * one is added.
+	 *
+	 * <p>Two comparisons, because an instance's coordinates are a copy placed wherever the server
+	 * has room. Going from Araxxor's lair straight into a player-owned house is instance to
+	 * instance, and the two copies may happen to sit close together; the tiles they were copied
+	 * from don't. Those template tiles are only trusted across a loading screen, since a house is
+	 * built from rooms copied out of scattered templates and walking between two of them jumps
+	 * just as far.
+	 */
+	static boolean isTeleport(@Nullable WorldPoint from, @Nullable WorldPoint to,
+		@Nullable WorldPoint fromTemplate, @Nullable WorldPoint toTemplate, boolean loadingScreen)
+	{
+		return isTeleport(from, to) || (loadingScreen && isTeleport(fromTemplate, toTemplate));
+	}
+
+	/**
+	 * Whether two positions are further apart than walking covers in a tick. Measured on the
+	 * ground plane only, so climbing a staircase in place isn't a teleport.
+	 */
+	static boolean isTeleport(@Nullable WorldPoint from, @Nullable WorldPoint to)
+	{
+		if (from == null || to == null)
+		{
+			return false;
+		}
+		return Math.max(Math.abs(from.getX() - to.getX()), Math.abs(from.getY() - to.getY()))
+			> TELEPORT_MIN_TILES;
 	}
 
 	/**
@@ -2832,7 +3181,11 @@ public class SlayerTaskLootPlugin extends Plugin
 	{
 		final GameState state = event.getGameState();
 
-		if (state == GameState.LOGGED_IN)
+		if (state == GameState.LOADING)
+		{
+			loadedSinceLastTick = true;
+		}
+		else if (state == GameState.LOGGED_IN)
 		{
 			// LOGGED_IN is not the login event its name suggests: it fires again after every
 			// loading screen — a teleport, a dungeon entrance, a region boundary. Everything
@@ -2884,6 +3237,11 @@ public class SlayerTaskLootPlugin extends Plugin
 			specialEnergyLastSeen = -1;
 			// Tick-count anchors, so meaningless once the count restarts.
 			lastCannonballCount = -1;
+			lastTaskHitTick = -1;
+			teleportTick = -1;
+			lastPlayerLocation = null;
+			lastTemplateLocation = null;
+			loadedSinceLastTick = false;
 			deathSettleTicks = -1;
 			supplyTracker.clear();
 			pendingLoot.clear();
@@ -3238,6 +3596,20 @@ public class SlayerTaskLootPlugin extends Plugin
 	// ------------------------------------------------------------------
 
 	/**
+	 * What a supply row's quantity counts, for the row to say so. Food eaten in halves and slices
+	 * is counted the same way a potion is, but "x6 doses" of wild pie reads as a mistake where
+	 * "x6 portions" reads as what happened.
+	 */
+	private static String supplyUnit(SupplyEntry supply, String name)
+	{
+		if (!supply.isDoseBased())
+		{
+			return "";
+		}
+		return SupplyTracker.portionCount(name) > 0 ? "portions" : "doses";
+	}
+
+	/**
 	 * Resolves names and prices here on the client thread, then hands the panel immutable
 	 * views so it never reads game state off the Swing thread.
 	 */
@@ -3368,7 +3740,7 @@ public class SlayerTaskLootPlugin extends Plugin
 
 			supplyRows.add(new TaskView.LootRow(
 				itemId, name, supply.getQuantity(), supply.getValue(),
-				supply.isDoseBased() ? "doses" : "",
+				supplyUnit(supply, itemName(itemId)),
 				Collections.unmodifiableList(breakdown)));
 		}
 
@@ -3498,6 +3870,8 @@ public class SlayerTaskLootPlugin extends Plugin
 		private final Collection<ItemStack> items;
 		private final LootSource source;
 		private final String sessionId;
+		/** Whether this is the late loot of a credited kill that was still waiting for it. */
+		private boolean claimedWaitingKill;
 
 		private PendingLoot(int tick, int npcIndex, String npcName, Collection<ItemStack> items,
 			LootSource source, String sessionId)
@@ -3606,10 +3980,10 @@ public class SlayerTaskLootPlugin extends Plugin
 		private final String sessionId;
 		private final int itemId;
 		private int quantity;
-		private final int unitPrice;
+		private final long unitPrice;
 
 		private PendingCollectedDrop(int tick, String sessionId, int itemId, int quantity,
-			int unitPrice)
+			long unitPrice)
 		{
 			this.tick = tick;
 			this.sessionId = sessionId;

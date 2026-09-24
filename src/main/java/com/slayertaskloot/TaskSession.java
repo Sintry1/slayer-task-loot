@@ -121,11 +121,22 @@ class TaskSession
 
 	void resume(long now)
 	{
+		resume(now, true);
+	}
+
+	void resume(long now, boolean openedManually)
+	{
 		if (!isOpen())
 		{
 			endedAt = 0;
-			openSegment(now, true);
+			openSegment(now, openedManually);
 		}
+	}
+
+	/** Why the most recent segment ended, or null while it is still running. */
+	String lastCloseReason()
+	{
+		return isOpen() ? null : getSegments().get(getSegments().size() - 1).getCloseReason();
 	}
 
 	void close(long now, String reason)

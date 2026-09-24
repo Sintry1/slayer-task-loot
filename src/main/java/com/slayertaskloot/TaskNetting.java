@@ -127,7 +127,7 @@ final class TaskNetting
 				continue;
 			}
 			dropped.add(entry.getKey());
-			totalDoses += (long) entry.getValue() * SupplyTracker.doseCount(name);
+			totalDoses += (long) entry.getValue() * SupplyTracker.unitsPerItem(name);
 			totalValue += netLootValues.getOrDefault(entry.getKey(), 0L);
 		}
 
@@ -254,7 +254,8 @@ final class TaskNetting
 	/** The dose count of {@code name}, or 0 unless it is a container of the {@code base} family. */
 	private static int matchingDoseCount(String base, String name)
 	{
-		return base.equalsIgnoreCase(SupplyTracker.doseBaseName(name)) ? SupplyTracker.doseCount(name) : 0;
+		return base.equalsIgnoreCase(SupplyTracker.doseBaseName(name))
+			? SupplyTracker.unitsPerItem(name) : 0;
 	}
 
 	private static long scaleValue(long value, int remaining, int original)

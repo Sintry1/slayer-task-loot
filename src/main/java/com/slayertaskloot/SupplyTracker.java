@@ -116,6 +116,12 @@ class SupplyTracker
 	 */
 	private static final int IGNORE_EXPIRY_TICKS = 3;
 
+	/**
+	 * Ticks a craft attempt stays live, long enough to get through a confirmation dialog. Renewed
+	 * by every crafted item, so a Make-All keeps it open for as long as it runs.
+	 */
+	private static final int CRAFT_WINDOW_TICKS = 10;
+
 	/** Rune pouch slots. Contents live in varbits rather than an item container. */
 	private static final int[] RUNE_POUCH_TYPE_VARBITS = {
 		VarbitID.RUNE_POUCH_TYPE_1,
@@ -145,6 +151,9 @@ class SupplyTracker
 
 	/** What the last {@link #charge()} saw arrive, as itemId -> quantity gained. */
 	private final Map<Integer, Integer> lastGains = new HashMap<>();
+
+	/** Ticks left on the latest craft attempt. See {@link #noteCraftAttempt()}. */
+	private int craftTicksLeft;
 	private boolean eyeUsesTears = true;
 
 	/** Whether burying or scattering prayer remains counts as a supply. See the config item. */
@@ -172,6 +181,27 @@ class SupplyTracker
 		snapshot = null;
 		pendingIgnores.clear();
 		lastGains.clear();
+		craftTicksLeft = 0;
+	}
+
+	/**
+	 * The player just did something that may make one item out of others — used an item on another
+	 * item, an object or an NPC, or picked a combining option.
+	 *
+	 * <p>Making something isn't consumption: the inputs haven't been used up, they've become the
+	 * thing that arrived. Billed, they posted the full price of whatever went in — an amulet of
+	 * torture and an etched fang crafted into an amulet of rancour charged the task over 47M, and a
+	 * noxious blade combined into a halberd was billed and then netted out of the task's drops.
+	 *
+	 * <p>Nothing is forgiven on the click alone. It takes a tick inside the window on which a
+	 * <em>new</em> item arrives — a family gaining items — for its losses to read as a craft. That
+	 * is what keeps the click from excusing real consumption: poisoning a weapon, drinking to an
+	 * empty vial and eating down to a pie dish all use an item up without anything new appearing
+	 * from the ingredients, or appear only as the same item in another form.
+	 */
+	void noteCraftAttempt()
+	{
+		craftTicksLeft = CRAFT_WINDOW_TICKS;
 	}
 
 	/**
@@ -248,6 +278,10 @@ class SupplyTracker
 		snapshot = takeSnapshot();
 		// The new baseline already reflects whatever happened, so nothing is left to forgive.
 		pendingIgnores.clear();
+		if (craftTicksLeft > 0)
+		{
+			craftTicksLeft--;
+		}
 	}
 
 	/**
@@ -371,21 +405,25 @@ class SupplyTracker
 
 			final String name = itemName(id);
 			final boolean currency = isCurrency(id);
-			final int doses = currency ? 0 : doseCount(name);
-			final int unitPrice = itemManager.getItemPrice(id);
+			final int doses = currency ? 0 : unitsFor(id, name);
+			final long unitPrice = itemManager.getItemPrice(id);
+			final String doseBase = doses > 0 ? doseBaseName(name) : null;
 			final String base = currency
 				? CURRENCY_FAMILY
-				: doses > 0
-					? name.substring(0, name.lastIndexOf('(')).trim()
+				: doseBase != null
+					? doseBase
 					: familyKey(id, name);
 
 			final Family family = families.computeIfAbsent(base, k -> new Family());
 			family.value += (long) delta * unitPrice;
 			family.units += familyUnits(id, delta, doses, unitPrice);
 
-			if (doses > 0)
+			if (doseBase != null)
 			{
 				family.doseBased = true;
+				// Portions are priced off the whole food rather than off a dose container, so
+				// the two resolve their unit price differently. See resolvePortionPrice().
+				family.portionFood = doseCount(name) <= 0;
 			}
 			// Represent the family by what was consumed, not what replaced it, so a row reads
 			// "Prayer potion" and not the 3-dose it turned into.
@@ -399,6 +437,13 @@ class SupplyTracker
 		final Map<Integer, Integer> snapshotBefore = snapshot;
 		snapshot = current;
 
+		final boolean crafted = craftTicksLeft > 0 && hasCraftedProduct(families);
+		if (crafted)
+		{
+			// Keep the window open for the next item of a Make-All.
+			craftTicksLeft = CRAFT_WINDOW_TICKS;
+		}
+
 		long total = 0;
 		final List<SupplyCharge.Row> rows = new ArrayList<>();
 
@@ -406,6 +451,13 @@ class SupplyTracker
 		{
 			final String base = entry.getKey();
 			final Family family = entry.getValue();
+
+			if (crafted && isCraftInput(base, family))
+			{
+				log.debug("not charging {} x{}: went into something crafted this tick",
+					itemName(family.representativeId), -family.units);
+				continue;
+			}
 
 			// One item out, one item in: a transformation, not consumption. A trident running dry
 			// or being recharged, barrows gear degrading a step, a scythe emptying — the item count
@@ -432,9 +484,11 @@ class SupplyTracker
 			}
 
 			long cost = -family.value;
-			if (family.doseBased && family.units < 0 && isDrinkable(family.representativeId))
+			if (family.doseBased && family.units < 0 && isConsumable(family.representativeId))
 			{
-				final DosePrice dosePrice = resolveDosePrice(base);
+				final DosePrice dosePrice = family.portionFood
+					? resolvePortionPrice(base)
+					: resolveDosePrice(base);
 				if (dosePrice != null)
 				{
 					final long numerator = (long) -family.units * dosePrice.fullPrice
@@ -451,7 +505,7 @@ class SupplyTracker
 			else if (family.doseBased)
 			{
 				// Teleport jewellery and other charged items also use numeric suffixes. Only an
-				// item with a Drink action may use potion normalization.
+				// item the player drinks or eats may use dose normalization.
 				family.doseBased = false;
 			}
 			total += cost;
@@ -467,6 +521,10 @@ class SupplyTracker
 		}
 
 		expireIgnoredRemovals();
+		if (craftTicksLeft > 0)
+		{
+			craftTicksLeft--;
+		}
 		if (!rows.isEmpty() && log.isDebugEnabled())
 		{
 			// Every charge, with the raw per-id deltas behind it. A charge that shouldn't have
@@ -584,6 +642,46 @@ class SupplyTracker
 			new SupplyCharge.Row(chargedItemId, 1, total, false, components)));
 	}
 
+	private static boolean hasCraftedProduct(Map<String, Family> families)
+	{
+		for (Map.Entry<String, Family> entry : families.entrySet())
+		{
+			final Family family = entry.getValue();
+			if (isCraftProduct(entry.getKey(), family.doseBased, family.units))
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private static boolean isCraftInput(String base, Family family)
+	{
+		return isCraftInput(base, family.doseBased, family.units);
+	}
+
+	/**
+	 * Whether a family's movement is something new having been made: more of it than before.
+	 *
+	 * <p>Coins are left out because alchemy produces them, and alchemy is billed through its own
+	 * path. Dose families are left out because a potion's doses reshuffle between containers
+	 * without anything being made. A family whose count didn't change — a weapon going from plain
+	 * to poisoned, a trident being charged — is the same item in another form, not a product.
+	 */
+	static boolean isCraftProduct(String base, boolean doseBased, long units)
+	{
+		return units > 0 && !doseBased && !CURRENCY_FAMILY.equals(base);
+	}
+
+	/**
+	 * Whether a family that lost items on a crafting tick went into the product rather than being
+	 * used. Food and potions still bill, since eating mid-craft is still eating, and so do coins.
+	 */
+	static boolean isCraftInput(String base, boolean doseBased, long units)
+	{
+		return units < 0 && !doseBased && !CURRENCY_FAMILY.equals(base);
+	}
+
 	/** Whether an item is coins or platinum tokens. See {@link #CURRENCY_ITEMS}. */
 	static boolean isCurrency(int itemId)
 	{
@@ -604,11 +702,46 @@ class SupplyTracker
 	 * <p>The unit only has to make the two sides of a transformation cancel; the value column is
 	 * computed separately and is unaffected by the choice.
 	 */
-	static long familyUnits(int itemId, int delta, int doses, int unitPrice)
+	static long familyUnits(int itemId, int delta, int doses, long unitPrice)
 	{
 		return isCurrency(itemId)
 			? (long) delta * unitPrice
 			: (long) delta * Math.max(doses, 1);
+	}
+
+	/**
+	 * Resolves a portion family to the whole food it is eaten out of, priced per portion.
+	 *
+	 * <p>Kept apart from {@link #resolveDosePrice(String)} rather than folded into it. That method
+	 * accepts only a (4) or a (2) because a potion's other containers are worth less per dose than
+	 * the full one, and widening it to whatever container it happened to see first would re-price
+	 * every potion in the game off a (3). A whole food has exactly one container, so there is
+	 * nothing to choose between here — only the whole itself will do.
+	 */
+	private DosePrice resolvePortionPrice(String base)
+	{
+		if (dosePrices.containsKey(base))
+		{
+			return dosePrices.get(base);
+		}
+
+		for (ItemPrice candidate : itemManager.search(base))
+		{
+			final String name = candidate.getName();
+			if (name == null || !base.equalsIgnoreCase(name))
+			{
+				continue;
+			}
+			final int portions = portionCount(name);
+			final long price = itemManager.getItemPrice(candidate.getId());
+			if (portions > 1 && price > 0)
+			{
+				final DosePrice whole = new DosePrice(candidate.getId(), portions, price);
+				dosePrices.put(base, whole);
+				return whole;
+			}
+		}
+		return null;
 	}
 
 	/** Resolves a dose family to its tradeable full container: (4), or (2) for mixes. */
@@ -672,7 +805,18 @@ class SupplyTracker
 		return "Item #" + itemId;
 	}
 
-	private boolean isDrinkable(int itemId)
+	/** Whether the player drinks or eats this item, which is what dose and portion pricing is for. */
+	private boolean isConsumable(int itemId)
+	{
+		return hasAction(itemId, "Drink") || hasAction(itemId, "Eat");
+	}
+
+	private boolean isEdible(int itemId)
+	{
+		return hasAction(itemId, "Eat");
+	}
+
+	private boolean hasAction(int itemId, String wanted)
 	{
 		try
 		{
@@ -681,7 +825,7 @@ class SupplyTracker
 			{
 				for (String action : comp.getInventoryActions())
 				{
-					if ("Drink".equalsIgnoreCase(action))
+					if (wanted.equalsIgnoreCase(action))
 					{
 						return true;
 					}
@@ -693,6 +837,25 @@ class SupplyTracker
 			// Fall back to the observed variant-value delta if composition data is unavailable.
 		}
 		return false;
+	}
+
+	/**
+	 * How many units of its family this item holds — doses for a "(n)" container, portions for food
+	 * eaten in more than one bite, and 0 for anything counted in whole items.
+	 *
+	 * <p>The portion half is asked of the item rather than of its name alone, because the pie
+	 * family holds the uncooked and burnt forms as well and neither is eaten in halves. Counting
+	 * those in portions would report one uncooked pie as a supply of two.
+	 */
+	private int unitsFor(int itemId, String name)
+	{
+		final int doses = doseCount(name);
+		if (doses > 0)
+		{
+			return doses;
+		}
+		final int portions = portionCount(name);
+		return portions > 0 && isEdible(itemId) ? portions : 0;
 	}
 
 	boolean isLootOnlyItem(int itemId)
@@ -813,18 +976,138 @@ class SupplyTracker
 	}
 
 	/**
-	 * An item name with its "(n)" removed, or null when the name isn't a dose container.
+	 * An item name reduced to the family it is counted in: a potion without its "(n)", or the whole
+	 * food a portion came out of. Null when the item is counted in whole items.
 	 *
 	 * <p>Trimmed, because the space before the dose is present in some names and not others.
 	 */
 	static String doseBaseName(String name)
 	{
-		if (name == null || doseCount(name) <= 0)
+		if (name == null)
 		{
 			return null;
 		}
+		if (doseCount(name) <= 0)
+		{
+			return portionBaseName(name);
+		}
 		final int open = name.lastIndexOf('(');
 		return open <= 0 ? null : name.substring(0, open).trim();
+	}
+
+	/**
+	 * How many units of its family this item name holds, counting doses and food portions alike.
+	 *
+	 * <p>The pairing of {@link #doseBaseName(String)} — what netting needs to put a supply row and
+	 * the drop that paid for it into the same units.
+	 */
+	static int unitsPerItem(String name)
+	{
+		final int doses = doseCount(name);
+		return doses > 0 ? doses : portionCount(name);
+	}
+
+	/** Parts of a whole food whose name shares no stem with the whole they came out of. */
+	private static final Map<String, String> NAMED_FOOD_PARTS = new HashMap<>();
+
+	/** How a part of a whole food is named, and how many portions that part holds. */
+	private static final Map<String, Integer> FOOD_PART_PREFIXES = new LinkedHashMap<>();
+
+	/** Whole foods eaten in three, which nothing in their names gives away. */
+	private static final Set<String> FOODS_EATEN_IN_THIRDS = new HashSet<>(Arrays.asList(
+		"cake", "chocolate cake", "birthday cake"));
+
+	static
+	{
+		NAMED_FOOD_PARTS.put("slice of cake", "cake");
+		NAMED_FOOD_PARTS.put("chocolate slice", "chocolate cake");
+		NAMED_FOOD_PARTS.put("slice of birthday cake", "birthday cake");
+
+		FOOD_PART_PREFIXES.put("half a ", 1);
+		FOOD_PART_PREFIXES.put("half an ", 1);
+		FOOD_PART_PREFIXES.put("1/2 ", 1);
+		FOOD_PART_PREFIXES.put("2/3 ", 2);
+	}
+
+	/**
+	 * Food eaten in more than one bite, counted in the parts it is eaten in.
+	 *
+	 * <p>A pie is two halves, a pizza two halves, a cake three slices. Each bite turns the item
+	 * into the next smaller one, which the diff sees as one item leaving and another arriving —
+	 * the same shape as a dose of potion, and it goes wrong for the same reason if it isn't
+	 * counted the same way. In whole items, eating a wild pie is one pie out and one half in:
+	 * equal counts, so the transformation guard reads it as nothing consumed and bills none of it,
+	 * and the last bite then bills the untradeable half at 0 gp. Three pies eaten cost the task
+	 * nothing, while the pies that dropped stayed in the loot column at their full price — both
+	 * halves of that were reported.
+	 *
+	 * <p>In portions a pie is 2 and a half pie is 1, so a bite is a loss of one portion priced at
+	 * half of the whole pie, and netting can cancel the pies eaten against the pies dropped.
+	 *
+	 * @return the portions this item holds, or 0 when it is eaten in one
+	 */
+	static int portionCount(String name)
+	{
+		final String lower = name == null ? null : name.toLowerCase(java.util.Locale.ROOT);
+		if (lower == null)
+		{
+			return 0;
+		}
+		if (NAMED_FOOD_PARTS.containsKey(lower))
+		{
+			return 1;
+		}
+		for (Map.Entry<String, Integer> prefix : FOOD_PART_PREFIXES.entrySet())
+		{
+			if (lower.startsWith(prefix.getKey()))
+			{
+				return wholeFoodPortions(lower.substring(prefix.getKey().length())) > 1
+					? prefix.getValue()
+					: 0;
+			}
+		}
+		return wholeFoodPortions(lower);
+	}
+
+	/** The whole food a portion belongs to, lower case, or null when the name isn't one. */
+	static String portionBaseName(String name)
+	{
+		final String lower = name == null ? null : name.toLowerCase(java.util.Locale.ROOT);
+		if (lower == null)
+		{
+			return null;
+		}
+		final String named = NAMED_FOOD_PARTS.get(lower);
+		if (named != null)
+		{
+			return named;
+		}
+		for (Map.Entry<String, Integer> prefix : FOOD_PART_PREFIXES.entrySet())
+		{
+			if (lower.startsWith(prefix.getKey()))
+			{
+				final String whole = lower.substring(prefix.getKey().length());
+				return wholeFoodPortions(whole) > 1 ? whole : null;
+			}
+		}
+		return wholeFoodPortions(lower) > 1 ? lower : null;
+	}
+
+	/**
+	 * Portions a whole food is eaten in, or 0 when it is eaten in one.
+	 *
+	 * <p>By name, because nothing else distinguishes them: a half pie and a whole one share every
+	 * property the client exposes. Pies and pizzas are recognisable by their suffix; the cakes are
+	 * listed, since "Dwarven rock cake" is one bite and would be caught by any rule wide enough to
+	 * take the others.
+	 */
+	private static int wholeFoodPortions(String lower)
+	{
+		if (FOODS_EATEN_IN_THIRDS.contains(lower))
+		{
+			return 3;
+		}
+		return lower.endsWith(" pie") || lower.endsWith(" pizza") ? 2 : 0;
 	}
 
 	/**
@@ -944,6 +1227,8 @@ class SupplyTracker
 		/** Doses for dose-based families, plain item count otherwise. Negative means consumed. */
 		private long units;
 		private boolean doseBased;
+		/** Whether the family is food eaten in portions rather than a potion counted in doses. */
+		private boolean portionFood;
 		private int bestDose = -1;
 		private int representativeId;
 	}
@@ -952,9 +1237,9 @@ class SupplyTracker
 	{
 		private final int itemId;
 		private final int doses;
-		private final int fullPrice;
+		private final long fullPrice;
 
-		private DosePrice(int itemId, int doses, int fullPrice)
+		private DosePrice(int itemId, int doses, long fullPrice)
 		{
 			this.itemId = itemId;
 			this.doses = doses;
